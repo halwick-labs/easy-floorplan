@@ -350,51 +350,6 @@ export function rectAreaSideBoundarySegments(
   return segments;
 }
 
-function rectAreaSideWallSegmentBounds(
-  side: RectAreaSide,
-  points: readonly AreaPoint[],
-  segment: RectAreaSideWallSegment
-): { x1: number; y1: number; x2: number; y2: number } {
-  const [topLeft, topRight, bottomRight, bottomLeft] = points;
-  const sides: Record<RectAreaSide, { x1: number; y1: number; x2: number; y2: number }> = {
-    top: { x1: topLeft.x, y1: topLeft.y, x2: topRight.x, y2: topRight.y },
-    right: { x1: topRight.x, y1: topRight.y, x2: bottomRight.x, y2: bottomRight.y },
-    bottom: { x1: bottomRight.x, y1: bottomRight.y, x2: bottomLeft.x, y2: bottomLeft.y },
-    left: { x1: bottomLeft.x, y1: bottomLeft.y, x2: topLeft.x, y2: topLeft.y },
-  };
-
-  const base = sides[side];
-  const dx = base.x2 - base.x1;
-  const dy = base.y2 - base.y1;
-  const startFrac = segment.start;
-  const endFrac = segment.end;
-
-  if (Math.abs(base.x2 - base.x1) < RECT_AREA_EPSILON) {
-    return {
-      x1: base.x1,
-      y1: base.y1 + dy * startFrac,
-      x2: base.x2,
-      y2: base.y1 + dy * endFrac,
-    };
-  }
-
-  if (Math.abs(base.y2 - base.y1) < RECT_AREA_EPSILON) {
-    return {
-      x1: base.x1 + dx * startFrac,
-      y1: base.y1,
-      x2: base.x1 + dx * endFrac,
-      y2: base.y2,
-    };
-  }
-
-  return {
-    x1: base.x1 + dx * startFrac,
-    y1: base.y1 + dy * startFrac,
-    x2: base.x1 + dx * endFrac,
-    y2: base.y1 + dy * endFrac,
-  };
-}
-
 export function rectAreaSideWalls(
   areaId: string,
   points: readonly AreaPoint[],

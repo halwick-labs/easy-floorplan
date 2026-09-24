@@ -24,8 +24,6 @@ import type {
   AreaPoint,
   HaAreaInfo,
   RectAreaSide,
-  RectAreaSideWallSegment,
-  RectAreaSideWallValue,
   StateColorRule,
   OverlayScale,
   PaletteColor,
@@ -113,7 +111,6 @@ import {
   renderAreaBorder,
   renderDeadSpace,
   renderDeadSpaceHatch,
-  pointInPolygon,
   trackerSensorReading,
   kindFromEntity,
   resolveItemIcon,
@@ -146,7 +143,7 @@ import {
   normalizeOverlayMinWidth,
   overlayLength,
 } from "./render";
-import { deadSpacesCached, signedArea, traceFaces } from "./dead-space";
+import { deadSpacesCached } from "./dead-space";
 import { cssColor, cssColorOr, cssNumber, contrastText } from "./css-safe";
 import { skinStyle, skinTokens, SKIN_ACCENT, SKIN_PAPER, SKIN_TEXT, SKIN_WALL } from "./skins";
 import {
@@ -174,17 +171,14 @@ import {
   layoutPointsInPolygon,
   nearestAreaSnapPoint,
   nearestCorner,
-  rectAreaSideWallNext,
   rectAreaSideWallSegments,
   rectAreaSideBoundarySegments,
   rectAreaClamp,
   rectAreaEdgeResize,
   rectAreaHasMinimumSize,
-  rectAreaPoints,
   rectAreaVertexResize,
   RECT_AREA_EPSILON,
   rectAreaWallId,
-  rectAreaSharedEdgeCouple,
   rectAreaSharedSides,
   rectAreaSideWalls,
   isRectArea,
@@ -195,9 +189,27 @@ import {
   type Sel,
   type SelKind,
 } from "./editor-geometry";
+import {
+  coupledEdgeResize,
+  coupleRectAreaSharedEdges,
+} from "./area-push-tools";
 import { FrameCoalescer, rafScheduler } from "./frame-coalescer";
 import { applyCardConfig } from "./editor-save";
 import type { AreaEntityScope } from "./editor-forms";
+import {
+  mergeRectAreaSide,
+  rectAreaEdgeCursor,
+  rectAreaEdgeFraction,
+  rectAreaEdgeModifierClass,
+  rectAreaEdgeSide,
+  splitRectAreaSide,
+  toggleRectAreaSide,
+  updateAreaRectangleDraft,
+} from "./area-tools";
+import {
+  applyAreaWallSegmentDrag,
+  removeAreaWallSegment,
+} from "./area-wall-segment-tools";
 import {
   furnitureChoices,
   furnitureLabel,
@@ -586,15 +598,6 @@ export class FloorplanCardEditor extends LitElement {
   private _clipboard: Clipboard | null = null;
   private _onKeyDown = (ev: KeyboardEvent) => this._handleKeyDown(ev);
   private _onKeyUp = (ev: KeyboardEvent) => {
-    console.log("DEBUG keyup", JSON.stringify({
-      key: ev.key,
-      shiftKey: ev.shiftKey,
-      ctrlKey: ev.ctrlKey,
-      metaKey: ev.metaKey,
-      areaEdgeModifierBefore: this._areaEdgeModifier,
-      selectedWallSegment: this._selectedWallSegment,
-      selection: this._selection,
-    }));
     if (!ev.shiftKey && !(ev.ctrlKey || ev.metaKey)) this._areaEdgeModifier = null;
   };
   private _onHostKeyDown = (ev: KeyboardEvent) => {
@@ -1224,20 +1227,10 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _clearSelectedWallSegment(): void {
-    console.log("DEBUG clearSelectedWallSegment", JSON.stringify({
-      before: this._selectedWallSegment,
-      selection: this._selection,
-      reason: "clearSelectedWallSegment",
-    }));
     this._selectedWallSegment = null;
   }
 
   private _selectOne(sel: Sel): void {
-    console.log("DEBUG selectOne", JSON.stringify({
-      incoming: sel,
-      oldSelection: this._selection,
-      oldSelectedWallSegment: this._selectedWallSegment,
-    }));
     this._selection = [sel];
     this._clearSelectedWallSegment();
     // Selection changes end any live-edit burst: re-selecting the same
@@ -1246,11 +1239,6 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _toggleSel(sel: Sel): void {
-    console.log("DEBUG toggleSel", JSON.stringify({
-      incoming: sel,
-      oldSelection: this._selection,
-      oldSelectedWallSegment: this._selectedWallSegment,
-    }));
     this._selection = this._isSel(sel.kind, sel.id)
       ? this._selection.filter((s) => !(s.kind === sel.kind && s.id === sel.id))
       : [...this._selection, sel];
@@ -1259,10 +1247,6 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _clearSel(): void {
-    console.log("DEBUG clearSel", JSON.stringify({
-      oldSelection: this._selection,
-      oldSelectedWallSegment: this._selectedWallSegment,
-    }));
     this._selection = [];
     this._clearSelectedWallSegment();
     this._liveEditKey = null;
@@ -1291,17 +1275,6 @@ export class FloorplanCardEditor extends LitElement {
 
   private _handleKeyDown(ev: KeyboardEvent): void {
     this._areaEdgeModifier = ev.shiftKey ? "join" : ev.ctrlKey || ev.metaKey ? "split" : null;
-    if (ev.key === "Shift" || ev.key === "Control" || ev.key === "Meta" || ev.key === "Delete" || ev.key === "Backspace") {
-      console.log("DEBUG keydown", JSON.stringify({
-        key: ev.key,
-        shiftKey: ev.shiftKey,
-        ctrlKey: ev.ctrlKey,
-        metaKey: ev.metaKey,
-        selection: this._selection,
-        selectedWallSegment: this._selectedWallSegment,
-        areaEdgeModifier: this._areaEdgeModifier,
-      }));
-    }
     // The listener is on `window` (capture phase) so HA's dialog can't swallow
     // arrow keys before we see them — the canvas itself isn't focusable. But
     // that also means a hidden/background editor instance would otherwise react,
@@ -1439,12 +1412,6 @@ export class FloorplanCardEditor extends LitElement {
     }
     const hasSelectionTarget = this._selection.length > 0 || !!this._selectedWallSegment;
     if ((ev.key === "Delete" || ev.key === "Backspace") && hasSelectionTarget) {
-      console.log("DEBUG delete key pressed", {
-        key: ev.key,
-        hasSelectionTarget,
-        selection: this._selection,
-        selectedWallSegment: this._selectedWallSegment,
-      });
       ev.preventDefault();
       this._deleteSelected();
       return;
@@ -1539,18 +1506,6 @@ export class FloorplanCardEditor extends LitElement {
 
   private _onCanvasDown(ev: PointerEvent): void {
     if (ev.button !== 0) return;
-    console.log("DEBUG canvas pointerdown", JSON.stringify({
-      pointerId: ev.pointerId,
-      client: { x: ev.clientX, y: ev.clientY },
-      buttons: ev.buttons,
-      ctrlKey: ev.ctrlKey,
-      metaKey: ev.metaKey,
-      shiftKey: ev.shiftKey,
-      gesturePointer: this._gesturePointer,
-      areaEdgeModifier: this._areaEdgeModifier,
-      selection: this._selection,
-      selectedWallSegment: this._selectedWallSegment,
-    }));
     // One gesture at a time: a second touch must not hijack the state machine.
     if (this._gesturePointer !== null) return;
     this._canvasWrap?.focus({ preventScroll: true });
@@ -1734,19 +1689,6 @@ export class FloorplanCardEditor extends LitElement {
     }
     if (this._drag) {
       const point = this._toVirtual(ev, false);
-      console.log("DEBUG canvas move while dragging", JSON.stringify({
-        hasSideWallSegment: !!this._drag.sideWallSegment,
-        sideWallSegment: this._drag.sideWallSegment,
-        primary: this._drag.primary,
-        pointer: { x: ev.clientX, y: ev.clientY },
-        point,
-        buttons: ev.buttons,
-        ctrlKey: ev.ctrlKey,
-        metaKey: ev.metaKey,
-        shiftKey: ev.shiftKey,
-        selection: this._selection,
-        selectedWallSegment: this._selectedWallSegment,
-      }));
       this._dragMoves.push({ ...point, altKey: ev.altKey });
     }
   }
@@ -1917,7 +1859,7 @@ export class FloorplanCardEditor extends LitElement {
     const raw = area.sideWalls?.[side];
     const segments = rectAreaSideWallSegments(raw);
     const seg = segments[segmentIndex];
-    if (!seg) return undefined;
+    if (!seg || seg.state === "none") return undefined;
     return { start: seg.start, end: seg.end, state: seg.state };
   }
 
@@ -1926,16 +1868,6 @@ export class FloorplanCardEditor extends LitElement {
     info: { area: Area; side: RectAreaSide; edgeIndex: number; segmentIndex: number },
     mode: "segment" | "start" | "end"
   ): void {
-    console.log("DEBUG startSideWallSegmentDrag", JSON.stringify({
-      pointer: { x: ev.clientX, y: ev.clientY },
-      info,
-      selection: this._selection,
-      selectedWallSegment: this._selectedWallSegment,
-      ctrlKey: ev.ctrlKey,
-      metaKey: ev.metaKey,
-      shiftKey: ev.shiftKey,
-      buttons: ev.buttons,
-    }));
     if (this._tool !== "select" || info.area.locked) return;
     ev.stopPropagation();
     ev.preventDefault();
@@ -2035,238 +1967,7 @@ export class FloorplanCardEditor extends LitElement {
     movingSide?: RectAreaSide,
     movingBoundary?: number
   ): { areas: Area[]; coupledIds: Set<string> } {
-    let primaryPoints = points;
-    const sharedReference = points;
-    const updated = new Map<string, AreaPoint[]>();
-    const coupledIds = new Set<string>();
-
-    for (const other of areas) {
-      if (other.id === primaryId) continue;
-      const otherPoints = updated.get(other.id) ?? other.points;
-      // Every neighbor is compared with the same pre-drag boundary. This is
-      // important when one long edge abuts two shorter edges: after the first
-      // neighbor moves, the primary boundary is no longer at its old position.
-      if (other.locked) continue;
-      const coupled = rectAreaSharedEdgeCouple(sharedReference, otherPoints, delta, movingSide);
-      if (!coupled) {
-        const polygonCoupled = this._coupleSharedBoundarySegment(
-          sharedReference,
-          otherPoints,
-          delta,
-          movingSide,
-          movingBoundary
-        );
-        if (!polygonCoupled) {
-          console.log("DEBUG shared-edge no match", JSON.stringify({
-            primaryId,
-            otherId: other.id,
-            movingSide,
-            delta,
-            primaryPoints: sharedReference,
-            otherPoints,
-          }));
-          continue;
-        }
-        primaryPoints = this._moveAreaBoundary(
-          sharedReference,
-          delta,
-          movingSide,
-          movingBoundary
-        ) ?? primaryPoints;
-        console.log("DEBUG shared-edge polygon match", JSON.stringify({
-          primaryId,
-          otherId: other.id,
-          movingSide,
-          delta,
-          primaryBefore: sharedReference,
-          primaryAfter: primaryPoints,
-          otherBefore: otherPoints,
-          otherAfter: polygonCoupled,
-        }));
-        updated.set(other.id, polygonCoupled);
-        coupledIds.add(other.id);
-        continue;
-      }
-      console.log("DEBUG shared-edge rect match", JSON.stringify({
-        primaryId,
-        otherId: other.id,
-        movingSide,
-        delta,
-        primaryBefore: sharedReference,
-        primaryAfter: coupled.points,
-        otherBefore: otherPoints,
-        otherAfter: coupled.other,
-      }));
-      primaryPoints = coupled.points;
-      updated.set(other.id, coupled.other);
-      coupledIds.add(other.id);
-    }
-
-    const result = {
-      areas: areas.map((a) => {
-        if (a.id === primaryId) return { ...a, points: primaryPoints };
-        const next = updated.get(a.id);
-        return next ? { ...a, points: next } : a;
-      }),
-      coupledIds,
-    };
-
-    return result;
-  }
-
-  private _moveAreaBoundary(
-    points: readonly AreaPoint[],
-    delta: { dx: number; dy: number },
-    movingSide?: RectAreaSide,
-    movingBoundary?: number
-  ): AreaPoint[] | undefined {
-    if (!movingSide) return undefined;
-    const isVertical = movingSide === "left" || movingSide === "right";
-    const bounds = {
-      minX: Math.min(...points.map((p) => p.x)),
-      maxX: Math.max(...points.map((p) => p.x)),
-      minY: Math.min(...points.map((p) => p.y)),
-      maxY: Math.max(...points.map((p) => p.y)),
-    };
-    const boundary = movingBoundary ?? (
-      isVertical
-        ? (movingSide === "right" ? bounds.maxX : bounds.minX)
-        : (movingSide === "bottom" ? bounds.maxY : bounds.minY)
-    );
-    const next = points.map((point) => {
-      if (isVertical) {
-        if (Math.abs(point.x - boundary) > RECT_AREA_EPSILON) return { ...point };
-        return { ...point, x: boundary + delta.dx };
-      }
-      if (Math.abs(point.y - boundary) > RECT_AREA_EPSILON) return { ...point };
-      return { ...point, y: boundary + delta.dy };
-    });
-    return next;
-  }
-
-  private _coupleSharedBoundarySegment(
-    points: readonly AreaPoint[],
-    other: readonly AreaPoint[],
-    delta: { dx: number; dy: number },
-    movingSide?: RectAreaSide,
-    movingBoundary?: number
-  ): AreaPoint[] | undefined {
-    if (!movingSide) return undefined;
-    if (Math.abs(delta.dx) < RECT_AREA_EPSILON && Math.abs(delta.dy) < RECT_AREA_EPSILON) return undefined;
-
-    const bounds = {
-      minX: Math.min(...points.map((p) => p.x)),
-      maxX: Math.max(...points.map((p) => p.x)),
-      minY: Math.min(...points.map((p) => p.y)),
-      maxY: Math.max(...points.map((p) => p.y)),
-    };
-    const otherBounds = {
-      minX: Math.min(...other.map((p) => p.x)),
-      maxX: Math.max(...other.map((p) => p.x)),
-      minY: Math.min(...other.map((p) => p.y)),
-      maxY: Math.max(...other.map((p) => p.y)),
-    };
-
-    const isVertical = movingSide === "left" || movingSide === "right";
-    const primaryBoundary = movingBoundary ?? (
-      isVertical
-        ? (movingSide === "right" ? bounds.maxX : bounds.minX)
-        : (movingSide === "bottom" ? bounds.maxY : bounds.minY)
-    );
-    const otherBoundary = primaryBoundary;
-    const boundaryIntervals = (
-      poly: readonly AreaPoint[],
-      boundary: number
-    ): Array<{ start: number; end: number }> => {
-      const intervals: Array<{ start: number; end: number }> = [];
-      for (let i = 0; i < poly.length; i++) {
-        const a = poly[i]!;
-        const b = poly[(i + 1) % poly.length]!;
-        if (isVertical) {
-          if (Math.abs(a.x - boundary) > RECT_AREA_EPSILON || Math.abs(b.x - boundary) > RECT_AREA_EPSILON) continue;
-          const start = Math.min(a.y, b.y);
-          const end = Math.max(a.y, b.y);
-          if (end - start > RECT_AREA_EPSILON) intervals.push({ start, end });
-          continue;
-        }
-        if (Math.abs(a.y - boundary) > RECT_AREA_EPSILON || Math.abs(b.y - boundary) > RECT_AREA_EPSILON) continue;
-        const start = Math.min(a.x, b.x);
-        const end = Math.max(a.x, b.x);
-        if (end - start > RECT_AREA_EPSILON) intervals.push({ start, end });
-      }
-      return intervals;
-    };
-
-    const primaryIntervals = boundaryIntervals(points, primaryBoundary);
-    const otherIntervals = boundaryIntervals(other, otherBoundary);
-    if (!primaryIntervals.length || !otherIntervals.length) return undefined;
-
-    const overlapIntervals: Array<{ start: number; end: number }> = [];
-    const matchedOtherIntervals: Array<{ start: number; end: number }> = [];
-    for (const a of primaryIntervals) {
-      for (const b of otherIntervals) {
-        const start = Math.max(a.start, b.start);
-        const end = Math.min(a.end, b.end);
-        if (end - start > RECT_AREA_EPSILON) {
-          overlapIntervals.push({ start, end });
-          matchedOtherIntervals.push({ start: b.start, end: b.end });
-        }
-      }
-    }
-    if (!overlapIntervals.length) return undefined;
-
-    const overlapStart = Math.min(...overlapIntervals.map((i) => i.start));
-    const overlapEnd = Math.max(...overlapIntervals.map((i) => i.end));
-
-    const coupled = other.map((point) => ({ ...point }));
-    const moveVertex = new Array<boolean>(other.length).fill(false);
-    let moved = false;
-
-    for (let i = 0; i < other.length; i++) {
-      const j = (i + 1) % other.length;
-      const a = other[i]!;
-      const b = other[j]!;
-      const edgeOnBoundary = isVertical
-        ? Math.abs(a.x - otherBoundary) <= RECT_AREA_EPSILON && Math.abs(b.x - otherBoundary) <= RECT_AREA_EPSILON
-        : Math.abs(a.y - otherBoundary) <= RECT_AREA_EPSILON && Math.abs(b.y - otherBoundary) <= RECT_AREA_EPSILON;
-      if (!edgeOnBoundary) continue;
-
-      const edgeStart = isVertical ? Math.min(a.y, b.y) : Math.min(a.x, b.x);
-      const edgeEnd = isVertical ? Math.max(a.y, b.y) : Math.max(a.x, b.x);
-      const overlaps = overlapIntervals.some((interval) => {
-        const start = Math.max(interval.start, edgeStart);
-        const end = Math.min(interval.end, edgeEnd);
-        return end - start > RECT_AREA_EPSILON;
-      });
-      if (!overlaps) continue;
-
-      moveVertex[i] = true;
-      moveVertex[j] = true;
-    }
-
-    for (let i = 0; i < coupled.length; i++) {
-      if (!moveVertex[i]) continue;
-      if (isVertical) coupled[i]!.x = primaryBoundary + delta.dx;
-      else coupled[i]!.y = primaryBoundary + delta.dy;
-      moved = true;
-    }
-
-    console.log("DEBUG shared-boundary segment", JSON.stringify({
-      movingSide,
-      delta,
-      isVertical,
-      primaryBoundary,
-      otherBoundary,
-      overlapStart,
-      overlapEnd,
-      overlapIntervals,
-      matchedOtherIntervals,
-      moved,
-      primaryBounds: bounds,
-      otherBounds,
-    }));
-
-    return moved ? coupled : undefined;
+    return coupleRectAreaSharedEdges(primaryId, points, delta, areas, movingSide, movingBoundary);
   }
 
   private _rectAreasOverlap(a: Area, b: Area): boolean {
@@ -2295,57 +1996,7 @@ export class FloorplanCardEditor extends LitElement {
     movingSide: RectAreaSide,
     movingBoundary?: number
   ): { areas: Area[]; coupledIds: Set<string>; delta: { dx: number; dy: number } } {
-    const requested = this._coupleRectAreaSharedEdges(
-      primaryId,
-      moving.points,
-      delta,
-      areas,
-      movingSide,
-      movingBoundary
-    );
-    if (!requested.coupledIds.size) return { ...requested, delta };
-
-    const componentIds = new Set([primaryId, ...requested.coupledIds]);
-    const obstacles = areas.filter((a) => !componentIds.has(a.id));
-    const collides = (candidate: { areas: Area[] }): boolean =>
-      candidate.areas.some(
-        (a) =>
-          componentIds.has(a.id) &&
-          ((isRectArea(a.points) && !rectAreaHasMinimumSize(a.points)) ||
-            obstacles.some((other) => this._rectAreasOverlap(a, other)))
-      );
-
-    if (!collides(requested)) return { ...requested, delta };
-
-    let low = 0;
-    let high = 1;
-    for (let i = 0; i < 18; i++) {
-      const scale = (low + high) / 2;
-      const candidateDelta = { dx: delta.dx * scale, dy: delta.dy * scale };
-      const candidate = this._coupleRectAreaSharedEdges(
-        primaryId,
-        moving.points,
-        candidateDelta,
-        areas,
-        movingSide,
-        movingBoundary
-      );
-      if (collides(candidate)) high = scale;
-      else low = scale;
-    }
-
-    const safeDelta = { dx: delta.dx * low, dy: delta.dy * low };
-    return {
-      ...this._coupleRectAreaSharedEdges(
-        primaryId,
-        moving.points,
-        safeDelta,
-        areas,
-        movingSide,
-        movingBoundary
-      ),
-      delta: safeDelta,
-    };
+    return coupledEdgeResize(primaryId, moving, delta, areas, movingSide, movingBoundary);
   }
 
   private _applyDrag(p: DragMove): void {
@@ -2366,16 +2017,6 @@ export class FloorplanCardEditor extends LitElement {
 
     if (drag.sideWallSegment) {
       const segDrag = drag.sideWallSegment;
-      console.log("DEBUG apply side wall segment drag", JSON.stringify({
-        drag,
-        start: drag.start,
-        current: this._dragMoves.last?.(),
-        areaId: segDrag.areaId,
-        side: segDrag.side,
-        segmentIndex: segDrag.segmentIndex,
-        mode: segDrag.mode,
-        areaCount: (f.areas ?? []).length,
-      }));
       const area = (f.areas ?? []).find((x) => x.id === segDrag.areaId);
       if (!area) return;
 
@@ -2416,17 +2057,17 @@ export class FloorplanCardEditor extends LitElement {
         nextEnd = Math.min(1, Math.max(segDrag.start + minSpan, segDrag.end + deltaFrac));
       }
 
-      const sideWalls = { ...(area.sideWalls ?? {}) };
-      const segments = rectAreaSideWallSegments(sideWalls[segDrag.side]).map((segment) => ({ ...segment }));
-      if (!segments[segDrag.segmentIndex]) return;
-      segments[segDrag.segmentIndex] = {
-        ...segments[segDrag.segmentIndex]!,
-        start: nextStart,
-        end: nextEnd,
+      const nextArea = applyAreaWallSegmentDrag(area, {
+        areaId: segDrag.areaId,
+        side: segDrag.side,
+        segmentIndex: segDrag.segmentIndex,
+        mode: segDrag.mode,
+        start: segDrag.start,
+        end: segDrag.end,
         state: segDrag.state,
-      };
-      sideWalls[segDrag.side] = segments;
-      this._updateArea(area.id, { sideWalls });
+      }, moveX, moveY);
+      if (!nextArea) return;
+      this._updateArea(area.id, { sideWalls: nextArea.sideWalls });
       return;
     }
 
@@ -2530,18 +2171,6 @@ export class FloorplanCardEditor extends LitElement {
         ? { dx: 0, dy: movedEdgeStart.y - edgeStart.y }
         : { dx: movedEdgeStart.x - edgeStart.x, dy: 0 };
       const movingSide = this._rectAreaEdgeSide(moving, idx);
-      console.log("DEBUG area-edge drag start", JSON.stringify({
-        areaId: drag.primary.id,
-        edgeIndex: idx,
-        movingSide,
-        horizontal,
-        target,
-        edgeStart,
-        edgeEnd,
-        before: moving.points,
-        tentative: points,
-        delta,
-      }));
       const coupled = this._coupledEdgeResize(
         drag.primary.id,
         moving,
@@ -2550,13 +2179,6 @@ export class FloorplanCardEditor extends LitElement {
         movingSide,
         horizontal ? edgeStart.y : edgeStart.x
       );
-      console.log("DEBUG area-edge drag coupled result", JSON.stringify({
-        areaId: drag.primary.id,
-        movingSide,
-        delta,
-        coupledIds: [...coupled.coupledIds],
-        areas: coupled.areas.map((a) => ({ id: a.id, points: a.points })),
-      }));
       const uncoupled = (coupled.areas ?? []).filter(
         (a) => a.id !== drag.primary.id && !coupled.coupledIds.has(a.id)
       );
@@ -2788,14 +2410,7 @@ export class FloorplanCardEditor extends LitElement {
   private _updateAreaRectangleDraft(target: AreaPoint): void {
     const start = this._areaDragStart;
     if (!start) return;
-    const snapped = { x: this._snap(target.x), y: this._snap(target.y) };
-    this._draftArea = {
-      points: rectAreaClamp(
-        rectAreaPoints({ x0: start.x, y0: start.y, x1: snapped.x, y1: snapped.y }),
-        this._floor().areas ?? [],
-        { dx: snapped.x - start.x, dy: snapped.y - start.y }
-      ),
-    };
+    this._draftArea = updateAreaRectangleDraft(start, target, this._floor().areas ?? [], (value) => this._snap(value));
   }
 
   /** Add one polygon vertex, or close the draft when clicking its start. */
@@ -2830,10 +2445,6 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _deleteSelected(): void {
-    console.log("DEBUG deleteSelected start", JSON.stringify({
-      selection: this._selection,
-      selectedWallSegment: this._selectedWallSegment,
-    }));
     const selectedWallSegment = this._selectedWallSegment;
     if (selectedWallSegment) {
       const f = this._floor();
@@ -2842,19 +2453,12 @@ export class FloorplanCardEditor extends LitElement {
         this._clearSelectedWallSegment();
         return;
       }
-      const sideWalls = { ...(area.sideWalls ?? {}) };
-      const current = sideWalls[selectedWallSegment.side];
-      const segments = rectAreaSideWallSegments(current).map((segment) => ({ ...segment }));
-      if (!segments.length) {
+      const nextArea = removeAreaWallSegment(area, selectedWallSegment.side, selectedWallSegment.segmentIndex);
+      if (!nextArea) {
         this._clearSelectedWallSegment();
         return;
       }
-      const kept = segments.filter((_, index) => index !== selectedWallSegment.segmentIndex);
-      if (!kept.length) delete sideWalls[selectedWallSegment.side];
-      else if (kept.length === 1 && kept[0]!.start <= RECT_AREA_EPSILON && kept[0]!.end >= 1 - RECT_AREA_EPSILON)
-        sideWalls[selectedWallSegment.side] = kept[0]!.state;
-      else sideWalls[selectedWallSegment.side] = kept;
-      this._updateArea(area.id, { sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined });
+      this._updateArea(area.id, { sideWalls: nextArea.sideWalls });
       this._clearSelectedWallSegment();
       return;
     }
@@ -5505,15 +5109,6 @@ export class FloorplanCardEditor extends LitElement {
               class=${["wall-hit", sideWallInfo ? "side-wall-edge" : "", selectedSideWall ? "selected" : "", edgeCursorClass].filter(Boolean).join(" ")}
               @pointerdown=${(e: PointerEvent) => {
                 if (sideWallInfo) {
-                  console.log("DEBUG sideWall pointerdown", JSON.stringify({
-                    ctrlKey: e.ctrlKey,
-                    metaKey: e.metaKey,
-                    shiftKey: e.shiftKey,
-                    buttons: e.buttons,
-                    sideWallInfo,
-                    beforeSelection: this._selection,
-                    beforeSelectedWallSegment: this._selectedWallSegment,
-                  }));
                   if (e.ctrlKey || e.metaKey) {
                     e.preventDefault();
                     e.stopPropagation();
@@ -5524,10 +5119,6 @@ export class FloorplanCardEditor extends LitElement {
                       segmentIndex: sideWallInfo.segmentIndex,
                     };
                     this._selection = [];
-                    console.log("DEBUG sideWall selected after ctrl pointerdown", JSON.stringify({
-                      selectedWallSegment: this._selectedWallSegment,
-                      selection: this._selection,
-                    }));
                     this._startSideWallSegmentDrag(e, sideWallInfo, "segment");
                     return;
                   }
@@ -5544,13 +5135,6 @@ export class FloorplanCardEditor extends LitElement {
               }}
               @click=${(e: PointerEvent) => {
                 if (sideWallInfo && (e.ctrlKey || e.metaKey)) {
-                  console.log("DEBUG sideWall click ctrl", JSON.stringify({
-                    sideWallInfo,
-                    selectionBefore: this._selection,
-                    selectedWallSegmentBefore: this._selectedWallSegment,
-                    ctrlKey: e.ctrlKey,
-                    metaKey: e.metaKey,
-                  }));
                   e.preventDefault();
                   e.stopPropagation();
                   this._selectedWallSegment = {
@@ -5560,10 +5144,6 @@ export class FloorplanCardEditor extends LitElement {
                     segmentIndex: sideWallInfo.segmentIndex,
                   };
                   this._selection = [];
-                  console.log("DEBUG sideWall click ctrl result", JSON.stringify({
-                    selectedWallSegment: this._selectedWallSegment,
-                    selection: this._selection,
-                  }));
                 }
               }}
               @dblclick=${(e: PointerEvent) => {
@@ -5782,307 +5362,31 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _toggleRectAreaSide(a: Area, edgeIndex: number, ev?: PointerEvent): void {
-    this._toggleRectAreaSideAt(a, edgeIndex, ev);
+    const clickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
+    const updated = toggleRectAreaSide(a, edgeIndex, clickT);
+    if (updated) this._updateArea(a.id, { sideWalls: updated.sideWalls });
   }
 
   private _rectAreaEdgeFraction(a: Area, edgeIndex: number, ev?: PointerEvent): number {
-    if (!ev) return 0.5;
-    if (ev.clientX === 0 && ev.clientY === 0) return 0.5;
-    const p = a.points[edgeIndex];
-    const next = a.points[(edgeIndex + 1) % a.points.length];
-    if (!p || !next) return 0.5;
-    const world = this._toVirtual(ev, false);
-    const dx = next.x - p.x;
-    const dy = next.y - p.y;
-    const t = Math.abs(dx) >= Math.abs(dy)
-      ? (Math.abs(dx) < RECT_AREA_EPSILON ? 0.5 : (world.x - p.x) / dx)
-      : (Math.abs(dy) < RECT_AREA_EPSILON ? 0.5 : (world.y - p.y) / dy);
-    return Math.min(1, Math.max(0, t));
-  }
-
-  private _normalizeRectAreaSideSegments(
-    segments: RectAreaSideWallSegment[]
-  ): RectAreaSideWallSegment[] {
-    const filtered = segments
-      .map((segment) => ({
-        start: Math.max(0, Math.min(1, segment.start)),
-        end: Math.max(0, Math.min(1, segment.end)),
-        state: segment.state,
-      }))
-      .filter(
-        (segment) =>
-          segment.end - segment.start > RECT_AREA_EPSILON &&
-          (segment.state === "wall" || segment.state === "divider")
-      )
-      .sort((a, b) => a.start - b.start);
-
-    const out: RectAreaSideWallSegment[] = [];
-    for (const segment of filtered) {
-      const last = out[out.length - 1];
-      if (!last) {
-        out.push({ ...segment });
-        continue;
-      }
-      if (segment.start < last.end - RECT_AREA_EPSILON && segment.state === last.state) {
-        last.end = Math.max(last.end, segment.end);
-        continue;
-      }
-      const start = segment.start < last.end - RECT_AREA_EPSILON ? Math.max(last.end, segment.start) : segment.start;
-      if (segment.end - start <= RECT_AREA_EPSILON) continue;
-      out.push({ ...segment, start });
-    }
-    return out;
-  }
-
-  private _segmentWindowAt(t: number, span = 0.3): { start: number; end: number } {
-    const half = span / 2;
-    let start = Math.max(0, t - half);
-    let end = Math.min(1, t + half);
-    if (end - start < 0.08) {
-      start = Math.max(0, t - 0.04);
-      end = Math.min(1, t + 0.04);
-    }
-    return { start, end };
-  }
-
-  private _toggleRectAreaSideAt(a: Area, edgeIndex: number, ev?: PointerEvent): void {
-    if (a.locked) return;
-    const side = this._rectAreaEdgeSide(a, edgeIndex);
-    const current = a.sideWalls?.[side];
-
-    if (Array.isArray(current)) {
-      const clickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
-      const nextSegments = rectAreaSideWallSegments(current).map((segment) => ({ ...segment }));
-      const hit = nextSegments.findIndex(
-        (segment) => clickT >= segment.start - RECT_AREA_EPSILON && clickT <= segment.end + RECT_AREA_EPSILON
-      );
-
-      if (hit >= 0) {
-        const seg = nextSegments[hit]!;
-        const next = rectAreaSideWallNext(seg.state);
-        if (next === "none") nextSegments.splice(hit, 1);
-        else nextSegments[hit] = { ...seg, state: next };
-      } else {
-        const w = this._segmentWindowAt(clickT);
-        nextSegments.push({ start: w.start, end: w.end, state: "wall" });
-      }
-
-      const normalized = this._normalizeRectAreaSideSegments(nextSegments);
-      const sideWalls = { ...(a.sideWalls ?? {}) };
-      if (!normalized.length) delete sideWalls[side];
-      else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
-        sideWalls[side] = normalized[0]!.state;
-      else sideWalls[side] = normalized;
-      this._updateArea(a.id, { sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined });
-      return;
-    }
-
-    const state = Array.isArray(current)
-      ? (current.length ? current[0]!.state : "none")
-      : (current ?? "none");
-    const next = rectAreaSideWallNext(state);
-    const sideWalls = { ...(a.sideWalls ?? {}) };
-    if (next === "none") delete sideWalls[side];
-    else sideWalls[side] = next;
-    this._updateArea(a.id, { sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined });
+    if (!ev) return rectAreaEdgeFraction(a, edgeIndex);
+    if (ev.clientX === 0 && ev.clientY === 0) return rectAreaEdgeFraction(a, edgeIndex, { x: 0, y: 0 });
+    return rectAreaEdgeFraction(a, edgeIndex, this._toVirtual(ev, false));
   }
 
   private _splitRectAreaSide(a: Area, edgeIndex: number, ev: PointerEvent): void {
-    if (a.locked) return;
-    const side = this._rectAreaEdgeSide(a, edgeIndex);
-    const sideWalls = { ...(a.sideWalls ?? {}) };
-    const prev = sideWalls[side] as RectAreaSideWallValue | undefined;
     const clickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
-    const hasPointerCoords = !(ev.clientX === 0 && ev.clientY === 0);
-    const window = this._segmentWindowAt(clickT);
-
-    if (typeof prev === "string" && prev !== "none") {
-      sideWalls[side] = [{ start: window.start, end: window.end, state: prev }];
-      this._updateArea(a.id, { sideWalls: sideWalls });
-      return;
-    }
-
-    const segments = rectAreaSideWallSegments(prev).map((segment) => ({ ...segment }));
-    if (!hasPointerCoords) {
-      const tail = segments.length ? Math.max(...segments.map((segment) => segment.end)) : 0;
-      const state = segments.length ? segments[segments.length - 1]!.state : "wall";
-      if (tail < 1 - RECT_AREA_EPSILON) {
-        segments.push({ start: tail, end: 1, state });
-      }
-    } else {
-      const existing = segments.find(
-        (segment) => clickT > segment.start + RECT_AREA_EPSILON && clickT < segment.end - RECT_AREA_EPSILON
-      );
-      const state = existing?.state ?? "wall";
-      segments.push({ start: window.start, end: window.end, state });
-    }
-
-    const normalized = this._normalizeRectAreaSideSegments(segments);
-    if (!normalized.length) delete sideWalls[side];
-    else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
-      sideWalls[side] = normalized[0]!.state;
-    else sideWalls[side] = normalized;
-    this._updateArea(a.id, { sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined });
-  }
-
-  private _rectAreaUnionPoints(a: AreaPoint[], other: AreaPoint[]): AreaPoint[] | undefined {
-    const xs = [...new Set([...a, ...other].map((point) => point.x))].sort((left, right) => left - right);
-    const ys = [...new Set([...a, ...other].map((point) => point.y))].sort((left, right) => left - right);
-    if (xs.length < 2 || ys.length < 2) return undefined;
-
-    const occupied = Array.from({ length: xs.length - 1 }, () =>
-      Array.from({ length: ys.length - 1 }, () => false)
-    );
-    for (let i = 0; i < xs.length - 1; i++) {
-      for (let j = 0; j < ys.length - 1; j++) {
-        const cx = (xs[i]! + xs[i + 1]!) / 2;
-        const cy = (ys[j]! + ys[j + 1]!) / 2;
-        occupied[i]![j] = pointInPolygon(a, cx, cy) || pointInPolygon(other, cx, cy);
-      }
-    }
-
-    const boundary: Array<{ a: AreaPoint; b: AreaPoint }> = [];
-    const addSegment = (a: AreaPoint, b: AreaPoint): void => {
-      if (Math.abs(a.x - b.x) < RECT_AREA_EPSILON && Math.abs(a.y - b.y) < RECT_AREA_EPSILON) return;
-      boundary.push({ a, b });
-    };
-
-    for (let i = 0; i < xs.length - 1; i++) {
-      for (let j = 0; j < ys.length - 1; j++) {
-        if (!occupied[i]?.[j]) continue;
-        const x0 = xs[i]!;
-        const x1 = xs[i + 1]!;
-        const y0 = ys[j]!;
-        const y1 = ys[j + 1]!;
-        const left = i > 0 && occupied[i - 1]?.[j];
-        const right = i < xs.length - 2 && occupied[i + 1]?.[j];
-        const below = j > 0 && occupied[i]?.[j - 1];
-        const above = j < ys.length - 2 && occupied[i]?.[j + 1];
-        if (!left) addSegment({ x: x0, y: y0 }, { x: x0, y: y1 });
-        if (!right) addSegment({ x: x1, y: y0 }, { x: x1, y: y1 });
-        if (!below) addSegment({ x: x0, y: y0 }, { x: x1, y: y0 });
-        if (!above) addSegment({ x: x0, y: y1 }, { x: x1, y: y1 });
-      }
-    }
-
-    const combine = [...a, ...other];
-    const centroid = {
-      x: combine.reduce((sum, point) => sum + point.x, 0) / combine.length,
-      y: combine.reduce((sum, point) => sum + point.y, 0) / combine.length,
-    };
-    const ring = traceFaces(boundary, 1e-6)
-      .filter((face) => face.length >= 3)
-      .filter((face) => pointInPolygon(face, centroid.x, centroid.y))
-      .sort((left, right) => Math.abs(signedArea(right)) - Math.abs(signedArea(left)))[0];
-    if (!ring) return undefined;
-
-    const collapseCollinear = (points: AreaPoint[]): AreaPoint[] => {
-      const out: AreaPoint[] = [];
-      for (let i = 0; i < points.length; i++) {
-        const prev = points[(i - 1 + points.length) % points.length]!;
-        const current = points[i]!;
-        const next = points[(i + 1) % points.length]!;
-        const dx1 = current.x - prev.x;
-        const dy1 = current.y - prev.y;
-        const dx2 = next.x - current.x;
-        const dy2 = next.y - current.y;
-        const cross = Math.abs(dx1 * dy2 - dy1 * dx2);
-        const onLine = cross < RECT_AREA_EPSILON && (
-          (Math.abs(current.x - prev.x) < RECT_AREA_EPSILON &&
-            Math.abs(current.x - next.x) < RECT_AREA_EPSILON &&
-            current.y >= Math.min(prev.y, next.y) - RECT_AREA_EPSILON &&
-            current.y <= Math.max(prev.y, next.y) + RECT_AREA_EPSILON) ||
-          (Math.abs(current.y - prev.y) < RECT_AREA_EPSILON &&
-            Math.abs(current.y - next.y) < RECT_AREA_EPSILON &&
-            current.x >= Math.min(prev.x, next.x) - RECT_AREA_EPSILON &&
-            current.x <= Math.max(prev.x, next.x) + RECT_AREA_EPSILON)
-        );
-        if (!onLine) out.push(current);
-      }
-      return out.length >= 3 ? out : points;
-    };
-
-    const simplified = collapseCollinear(ring.map((point) => ({ ...point })));
-    if (signedArea(simplified) < 0) simplified.reverse();
-    return simplified;
+    const updated = splitRectAreaSide(a, edgeIndex, clickT, !(ev.clientX === 0 && ev.clientY === 0));
+    if (updated) this._updateArea(a.id, { sideWalls: updated.sideWalls });
   }
 
   private _mergeRectAreaSide(a: Area, edgeIndex: number): void {
     if (a.locked) return;
-
-    const clickedSide = this._rectAreaEdgeSide(a, edgeIndex);
-    const candidates = (this._floor().areas ?? []).filter(
-      (candidate) =>
-        candidate.id !== a.id &&
-        !!a.haArea &&
-        a.haArea === candidate.haArea &&
-        rectAreaSharedSides(a.points, candidate.points).length > 0
-    );
-    const other = candidates.find((candidate) => {
-      const sharedSides = rectAreaSharedSides(a.points, candidate.points);
-      return sharedSides.includes(clickedSide) || sharedSides.includes(this._rectAreaOppositeSide(clickedSide));
-    }) ?? candidates[0];
-    if (!other) {
-      return;
-    }
-
-    const sharedSides = rectAreaSharedSides(a.points, other.points);
-    const side = sharedSides.includes(clickedSide)
-      ? clickedSide
-      : sharedSides.includes(this._rectAreaOppositeSide(clickedSide))
-        ? this._rectAreaOppositeSide(clickedSide)
-        : sharedSides[0];
-    if (!side) {
-      return;
-    }
-
-    const merged = this._rectAreaUnionPoints(a.points, other.points);
-    if (!merged) {
-      return;
-    }
-
-    const beforeArea = Math.abs(signedArea(a.points)) + Math.abs(signedArea(other.points));
-    const afterArea = Math.abs(signedArea(merged));
-    const valid = Math.abs(afterArea - beforeArea) < 0.01;
-
-    if (!valid) {
-      return;
-    }
-
-    const areas = (this._floor().areas ?? []).filter((candidate) => candidate.id !== a.id && candidate.id !== other.id);
-    this._commitFloor({
-      areas: [...areas, { ...a, points: merged, sideWalls: a.sideWalls ?? {} }],
-    });
-  }
-
-  private _rectAreaOppositeSide(side: RectAreaSide): RectAreaSide {
-    switch (side) {
-      case "top":
-        return "bottom";
-      case "bottom":
-        return "top";
-      case "left":
-        return "right";
-      case "right":
-        return "left";
-    }
+    const nextAreas = mergeRectAreaSide(a, edgeIndex, this._floor().areas ?? []);
+    if (nextAreas) this._commitFloor({ areas: nextAreas });
   }
 
   private _rectAreaEdgeSide(a: Area, edgeIndex: number): RectAreaSide {
-    const p = a.points[edgeIndex];
-    const next = a.points[(edgeIndex + 1) % a.points.length];
-    if (!p || !next) return RECT_AREA_SIDES[edgeIndex % RECT_AREA_SIDES.length];
-    const bounds = {
-      minX: Math.min(...a.points.map((point) => point.x)),
-      maxX: Math.max(...a.points.map((point) => point.x)),
-      minY: Math.min(...a.points.map((point) => point.y)),
-      maxY: Math.max(...a.points.map((point) => point.y)),
-    };
-    const horizontal = Math.abs(p.y - next.y) < RECT_AREA_EPSILON;
-    if (horizontal) {
-      return Math.abs(p.y - bounds.minY) < RECT_AREA_EPSILON ? "top" : "bottom";
-    }
-    return Math.abs(p.x - bounds.minX) < RECT_AREA_EPSILON ? "left" : "right";
+    return rectAreaEdgeSide(a, edgeIndex);
   }
 
   private _clickRectAreaSide(ev: PointerEvent, a: Area, edgeIndex: number): void {
@@ -6123,45 +5427,11 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _rectAreaEdgeModifierClass(a: Area, edgeIndex: number): string {
-    if (this._areaEdgeModifier === "join") {
-      const side = this._rectAreaEdgeSide(a, edgeIndex);
-      const delta = side === "left" || side === "right" ? { dx: 1, dy: 0 } : { dx: 0, dy: 1 };
-      const shared = (this._floor().areas ?? []).map((candidate) => {
-        if (candidate.id === a.id || !a.haArea || a.haArea !== candidate.haArea) return false;
-        const rectShared = rectAreaSharedSides(a.points, candidate.points);
-        if (rectShared.includes(side) || rectShared.includes(this._rectAreaOppositeSide(side))) return {
-          id: candidate.id,
-          rectShared,
-          polygonShared: true,
-        };
-        return {
-          id: candidate.id,
-          rectShared,
-          polygonShared: this._coupleSharedBoundarySegment(a.points, candidate.points, delta, side) !== undefined,
-        };
-      });
-      const hasMatch = shared.some((candidate) => !!candidate && candidate.polygonShared);
-      const className = hasMatch ? "modifier-ready" : "modifier-invalid";
-      console.log("_rectAreaEdgeModifierClass", JSON.stringify({
-        areaId: a.id,
-        edgeIndex,
-        side,
-        hasMatch,
-        className,
-        others: shared,
-      }));
-      return className;
-    }
-    if (this._areaEdgeModifier === "split") return "modifier-split";
-    return "";
+    return rectAreaEdgeModifierClass(a, edgeIndex, this._floor().areas ?? [], this._areaEdgeModifier ?? "");
   }
 
   private _rectAreaEdgeCursor(a: Area, edgeIndex: number, modifierClass: string): string {
-    if (modifierClass === "modifier-ready") return "copy";
-    if (modifierClass === "modifier-invalid") return "not-allowed";
-    const side = this._rectAreaEdgeSide(a, edgeIndex);
-    const isHorizontal = side === "top" || side === "bottom";
-    return isHorizontal ? "ns-resize" : "ew-resize";
+    return rectAreaEdgeCursor(a, edgeIndex, modifierClass);
   }
 
   private _renderAreaSel(a: Area, scopingId?: string): TemplateResult {
