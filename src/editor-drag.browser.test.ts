@@ -2002,7 +2002,9 @@ describe("editor drag", () => {
 
     const after = (ed as any)._floor().areas[0].sideWalls.top[0];
     expect(after.start !== before.start || after.end !== before.end).toBe(true);
-    expect(Math.abs((after.end - after.start) - (before.end - before.start))).toBeLessThan(0.05);
+    expect(after.end).toBeCloseTo(before.end, 2);
+    expect(after.start).toBeLessThan(before.start);
+    expect(after.end - after.start).toBeGreaterThan(before.end - before.start);
 
     document.body.innerHTML = "";
   });
