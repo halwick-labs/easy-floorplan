@@ -18,6 +18,69 @@ import { coupleSharedBoundarySegment } from "./area-push-tools";
 import { signedArea, traceFaces } from "./dead-space";
 import { pointInPolygon } from "./render";
 
+const AREA_TOOLS_DEBUG = true;
+const AREA_TOOLS_DEBUG_MAX_CHARS = 1200;
+const AREA_TOOLS_REPEAT_SUMMARY_EVERY = 20;
+const AREA_TOOLS_LABEL_ALLOW = [
+  "toggleRectAreaSide:",
+  "clickRectAreaSide:",
+];
+const areaToolsLogState = new Map<string, { text: string; count: number }>();
+
+function areaToolsDebugAllowed(label: string): boolean {
+  return AREA_TOOLS_LABEL_ALLOW.some((prefix) => label.startsWith(prefix));
+}
+
+function areaToolsCompact(value: unknown, depth = 0): unknown {
+  if (value == null) return value;
+  if (typeof value === "bigint") return String(value);
+  if (typeof value !== "object") return value;
+  if (value instanceof Set) return `Set(${value.size})`;
+  if (value instanceof Map) return `Map(${value.size})`;
+  if (Array.isArray(value)) {
+    if (depth >= 2) return `Array(${value.length})`;
+    const sample = value.slice(0, 6).map((item) => areaToolsCompact(item, depth + 1));
+    if (value.length > 6) sample.push(`...(+${value.length - 6})`);
+    return sample;
+  }
+  const input = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (key === "area" || key === "updated" || key === "sideWalls") {
+      out[key] = "[omitted]";
+      continue;
+    }
+    out[key] = depth >= 2 ? "[nested]" : areaToolsCompact(raw, depth + 1);
+  }
+  return out;
+}
+
+const serializeDebug = (value: unknown): string => {
+  const compact = areaToolsCompact(value);
+  const text = JSON.stringify(compact, null, 0);
+  if (!text) return String(compact);
+  if (text.length <= AREA_TOOLS_DEBUG_MAX_CHARS) return text;
+  return `${text.slice(0, AREA_TOOLS_DEBUG_MAX_CHARS)}... [truncated ${text.length - AREA_TOOLS_DEBUG_MAX_CHARS} chars]`;
+};
+const areaToolsDebug = (label: string, value: unknown): void => {
+  if (!AREA_TOOLS_DEBUG) return;
+  if (!areaToolsDebugAllowed(label)) return;
+  const text = serializeDebug(value);
+  const prev = areaToolsLogState.get(label);
+  if (prev && prev.text === text) {
+    prev.count += 1;
+    if (prev.count % AREA_TOOLS_REPEAT_SUMMARY_EVERY === 0) {
+      console.log(`[easy-floorplan:area-tools] ${label} (same payload repeated ${prev.count}x)`);
+    }
+    return;
+  }
+  if (prev && prev.count > 1) {
+    console.log(`[easy-floorplan:area-tools] ${label} (same payload repeated ${prev.count}x)`);
+  }
+  areaToolsLogState.set(label, { text, count: 1 });
+  console.log(`[easy-floorplan:area-tools] ${label}`, text);
+};
+
 export function updateAreaRectangleDraft(
   start: AreaPoint,
   target: AreaPoint,
@@ -111,26 +174,143 @@ export function rectAreaOppositeSide(side: RectAreaSide): RectAreaSide {
 }
 
 export function rectAreaEdgeSide(area: Area, edgeIndex: number): RectAreaSide {
-  const p = area.points[edgeIndex];
-  const next = area.points[(edgeIndex + 1) % area.points.length];
+  const points = area.points;
+  const len = points.length;
+  const p = points[edgeIndex];
+  const next = points[(edgeIndex + 1) % len];
   if (!p || !next) return RECT_AREA_SIDES[edgeIndex % RECT_AREA_SIDES.length];
-  const bounds = {
-    minX: Math.min(...area.points.map((point) => point.x)),
-    maxX: Math.max(...area.points.map((point) => point.x)),
-    minY: Math.min(...area.points.map((point) => point.y)),
-    maxY: Math.max(...area.points.map((point) => point.y)),
-  };
-  const horizontal = Math.abs(p.y - next.y) < RECT_AREA_EPSILON;
-  if (horizontal) {
-    return Math.abs(p.y - bounds.minY) < RECT_AREA_EPSILON ? "top" : "bottom";
+
+  let dx = next.x - p.x;
+  let dy = next.y - p.y;
+
+  if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
+    for (let step = 1; step < len; step++) {
+      const prev = points[(edgeIndex - step + len) % len];
+      const forward = points[(edgeIndex + step) % len];
+      if (!prev || !forward) continue;
+      const prevDx = forward.x - prev.x;
+      const prevDy = forward.y - prev.y;
+      if (Math.abs(prevDx) > RECT_AREA_EPSILON || Math.abs(prevDy) > RECT_AREA_EPSILON) {
+        dx = prevDx;
+        dy = prevDy;
+        break;
+      }
+    }
+    if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
+      return RECT_AREA_SIDES[edgeIndex % RECT_AREA_SIDES.length];
+    }
   }
-  return Math.abs(p.x - bounds.minX) < RECT_AREA_EPSILON ? "left" : "right";
+
+  const areaSign = signedArea(points);
+  const outward = areaSign >= 0
+    ? { x: dy, y: -dx }
+    : { x: -dy, y: dx };
+
+  if (Math.abs(outward.x) > Math.abs(outward.y)) {
+    return outward.x > 0 ? "right" : "left";
+  }
+  return outward.y > 0 ? "bottom" : "top";
 }
 
-export function toggleRectAreaSide(a: Area, edgeIndex: number, clickT = 0.5): Area | undefined {
+export function toggleRectAreaSide(
+  a: Area,
+  edgeIndex: number,
+  clickT = 0.5,
+  targetInterval?: { start: number; end: number }
+): Area | undefined {
   if (a.locked) return undefined;
   const side = rectAreaEdgeSide(a, edgeIndex);
   const current = a.sideWalls?.[side];
+  areaToolsDebug("toggleRectAreaSide:before", {
+    areaId: a.id,
+    edgeIndex,
+    side,
+    clickT,
+    targetInterval,
+    current,
+    sideWalls: a.sideWalls,
+  });
+
+  if (targetInterval) {
+    const start = Math.max(0, Math.min(1, targetInterval.start));
+    const end = Math.max(0, Math.min(1, targetInterval.end));
+    if (end - start <= RECT_AREA_EPSILON) return undefined;
+
+    const existing = normalizeRectAreaSideSegments(
+      rectAreaSideWallSegments(current).map((segment) => ({ ...segment }))
+    );
+    const clampedClick = Math.max(start, Math.min(end, clickT));
+    const targetStart = start;
+    const targetEnd = end;
+
+    // Edge toggles should operate on the full clicked edge interval, not a local
+    // click window. Treat the interval as "wall" / "divider" only when that
+    // whole interval is fully covered by exactly one state.
+    let currentState: "none" | "wall" | "divider" = "none";
+    if (existing.length) {
+      let cursor = targetStart;
+      let state: "wall" | "divider" | undefined;
+      let fullCoverage = true;
+      for (const segment of existing) {
+        const segStart = Math.max(targetStart, segment.start);
+        const segEnd = Math.min(targetEnd, segment.end);
+        if (segEnd - segStart <= RECT_AREA_EPSILON) continue;
+        if (segStart > cursor + RECT_AREA_EPSILON) {
+          fullCoverage = false;
+          break;
+        }
+        if (!state) state = segment.state;
+        else if (state !== segment.state) {
+          fullCoverage = false;
+          break;
+        }
+        cursor = Math.max(cursor, segEnd);
+      }
+      if (cursor < targetEnd - RECT_AREA_EPSILON) fullCoverage = false;
+      if (fullCoverage && state) currentState = state;
+    }
+
+    const nextState = rectAreaSideWallNext(currentState);
+    const nextSegments: RectAreaSideWallSegment[] = [];
+
+    for (const segment of existing) {
+      if (segment.end <= targetStart + RECT_AREA_EPSILON || segment.start >= targetEnd - RECT_AREA_EPSILON) {
+        nextSegments.push(segment);
+        continue;
+      }
+      if (segment.start < targetStart - RECT_AREA_EPSILON) {
+        nextSegments.push({ ...segment, end: targetStart });
+      }
+      if (segment.end > targetEnd + RECT_AREA_EPSILON) {
+        nextSegments.push({ ...segment, start: targetEnd });
+      }
+    }
+
+    if (nextState !== "none") {
+      nextSegments.push({ start: targetStart, end: targetEnd, state: nextState });
+    }
+
+    const normalized = normalizeRectAreaSideSegments(nextSegments);
+    const sideWalls = { ...(a.sideWalls ?? {}) };
+    if (!normalized.length) delete sideWalls[side];
+    else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
+      sideWalls[side] = normalized[0]!.state;
+    else sideWalls[side] = normalized;
+    const updated = { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+    areaToolsDebug("toggleRectAreaSide:after-interval", {
+      areaId: a.id,
+      side,
+      before: current,
+      after: updated.sideWalls,
+      targetInterval: { start, end },
+      targetRange: { start: targetStart, end: targetEnd },
+      clampedClick,
+      previousState: currentState,
+      nextState,
+      normalized,
+    });
+    return updated;
+  }
 
   if (Array.isArray(current)) {
     const nextSegments = rectAreaSideWallSegments(current).map((segment) => ({ ...segment }));
@@ -154,7 +334,16 @@ export function toggleRectAreaSide(a: Area, edgeIndex: number, clickT = 0.5): Ar
     else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
       sideWalls[side] = normalized[0]!.state;
     else sideWalls[side] = normalized;
-    return { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+    const updated = { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+    areaToolsDebug("toggleRectAreaSide:after-array", {
+      areaId: a.id,
+      side,
+      before: current,
+      after: updated.sideWalls,
+      nextSegments,
+      normalized,
+    });
+    return updated;
   }
 
   const state = Array.isArray(current)
@@ -164,7 +353,16 @@ export function toggleRectAreaSide(a: Area, edgeIndex: number, clickT = 0.5): Ar
   const sideWalls = { ...(a.sideWalls ?? {}) };
   if (next === "none") delete sideWalls[side];
   else sideWalls[side] = next;
-  return { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+  const updated = { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+  areaToolsDebug("toggleRectAreaSide:after-string", {
+    areaId: a.id,
+    side,
+    before: current,
+    after: updated.sideWalls,
+    previousState: state,
+    nextState: next,
+  });
+  return updated;
 }
 
 export function splitRectAreaSide(

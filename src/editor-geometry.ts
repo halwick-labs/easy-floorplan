@@ -74,6 +74,86 @@ export function isRectArea(points: readonly AreaPoint[]): boolean {
   }).every((point, index) => point.x === points[index]!.x && point.y === points[index]!.y);
 }
 
+/** Whether every edge is axis-aligned (horizontal or vertical). */
+export function isRectilinearArea(points: readonly AreaPoint[]): boolean {
+  if (points.length < 4) return false;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i]!;
+    const b = points[(i + 1) % points.length]!;
+    const dx = Math.abs(b.x - a.x);
+    const dy = Math.abs(b.y - a.y);
+    if (dx <= RECT_AREA_EPSILON && dy <= RECT_AREA_EPSILON) return false;
+    if (dx > RECT_AREA_EPSILON && dy > RECT_AREA_EPSILON) return false;
+  }
+  return true;
+}
+
+function polygonSignedArea(points: readonly AreaPoint[]): number {
+  if (points.length < 3) return 0;
+  let sum = 0;
+  for (let i = 0; i < points.length; i++) {
+    const a = points[i]!;
+    const b = points[(i + 1) % points.length]!;
+    sum += a.x * b.y - b.x * a.y;
+  }
+  return sum / 2;
+}
+
+function segmentIntersection(
+  a: AreaPoint,
+  b: AreaPoint,
+  c: AreaPoint,
+  d: AreaPoint
+): boolean {
+  const orient = (p: AreaPoint, q: AreaPoint, r: AreaPoint): number =>
+    (q.x - p.x) * (r.y - p.y) - (q.y - p.y) * (r.x - p.x);
+  const onSegment = (p: AreaPoint, q: AreaPoint, r: AreaPoint): boolean =>
+    q.x <= Math.max(p.x, r.x) + RECT_AREA_EPSILON &&
+    q.x >= Math.min(p.x, r.x) - RECT_AREA_EPSILON &&
+    q.y <= Math.max(p.y, r.y) + RECT_AREA_EPSILON &&
+    q.y >= Math.min(p.y, r.y) - RECT_AREA_EPSILON;
+
+  const o1 = orient(a, b, c);
+  const o2 = orient(a, b, d);
+  const o3 = orient(c, d, a);
+  const o4 = orient(c, d, b);
+
+  const proper =
+    (o1 > RECT_AREA_EPSILON && o2 < -RECT_AREA_EPSILON || o1 < -RECT_AREA_EPSILON && o2 > RECT_AREA_EPSILON) &&
+    (o3 > RECT_AREA_EPSILON && o4 < -RECT_AREA_EPSILON || o3 < -RECT_AREA_EPSILON && o4 > RECT_AREA_EPSILON);
+  if (proper) return true;
+
+  if (Math.abs(o1) <= RECT_AREA_EPSILON && onSegment(a, c, b)) return true;
+  if (Math.abs(o2) <= RECT_AREA_EPSILON && onSegment(a, d, b)) return true;
+  if (Math.abs(o3) <= RECT_AREA_EPSILON && onSegment(c, a, d)) return true;
+  if (Math.abs(o4) <= RECT_AREA_EPSILON && onSegment(c, b, d)) return true;
+  return false;
+}
+
+function hasSelfIntersection(points: readonly AreaPoint[]): boolean {
+  const n = points.length;
+  for (let i = 0; i < n; i++) {
+    const a1 = points[i]!;
+    const a2 = points[(i + 1) % n]!;
+    for (let j = i + 1; j < n; j++) {
+      const adjacent = j === i || j === (i + 1) % n || i === (j + 1) % n;
+      if (adjacent) continue;
+      const b1 = points[j]!;
+      const b2 = points[(j + 1) % n]!;
+      if (segmentIntersection(a1, a2, b1, b2)) return true;
+    }
+  }
+  return false;
+}
+
+function isValidRectilinearPolygon(points: readonly AreaPoint[]): boolean {
+  return (
+    isRectilinearArea(points) &&
+    Math.abs(polygonSignedArea(points)) > RECT_AREA_EPSILON &&
+    !hasSelfIntersection(points)
+  );
+}
+
 /** Smallest legal width or height for a rectangle room in virtual units. */
 export const MIN_RECT_AREA_SIZE = 1;
 
@@ -92,6 +172,40 @@ export function rectAreaVertexResize(points: readonly AreaPoint[], vertexIndex: 
   return fixedCorner
     ? rectAreaPoints({ x0: fixedCorner.x, y0: fixedCorner.y, x1: target.x, y1: target.y })
     : points.map((point) => ({ ...point }));
+}
+
+/**
+ * Resize one corner of a rectilinear (axis-aligned) polygon while keeping
+ * adjacent edges orthogonal by sliding neighboring vertices along their edge axes.
+ */
+export function rectilinearAreaVertexResize(
+  points: readonly AreaPoint[],
+  vertexIndex: number,
+  target: AreaPoint
+): AreaPoint[] {
+  if (!isRectilinearArea(points)) return points.map((point) => ({ ...point }));
+  const len = points.length;
+  const idx = ((vertexIndex % len) + len) % len;
+  const prevIdx = (idx - 1 + len) % len;
+  const nextIdx = (idx + 1) % len;
+
+  const prev = points[prevIdx]!;
+  const current = points[idx]!;
+  const next = points[nextIdx]!;
+  const out = points.map((point) => ({ ...point }));
+
+  const prevHorizontal = Math.abs(prev.y - current.y) <= RECT_AREA_EPSILON;
+  const prevVertical = Math.abs(prev.x - current.x) <= RECT_AREA_EPSILON;
+  if (prevHorizontal && !prevVertical) out[prevIdx] = { ...out[prevIdx]!, y: target.y };
+  else if (prevVertical && !prevHorizontal) out[prevIdx] = { ...out[prevIdx]!, x: target.x };
+
+  const nextHorizontal = Math.abs(next.y - current.y) <= RECT_AREA_EPSILON;
+  const nextVertical = Math.abs(next.x - current.x) <= RECT_AREA_EPSILON;
+  if (nextHorizontal && !nextVertical) out[nextIdx] = { ...out[nextIdx]!, y: target.y };
+  else if (nextVertical && !nextHorizontal) out[nextIdx] = { ...out[nextIdx]!, x: target.x };
+
+  out[idx] = { x: target.x, y: target.y };
+  return isValidRectilinearPolygon(out) ? out : points.map((point) => ({ ...point }));
 }
 
 /** Resize a rectangle area by moving one edge and keeping the opposite edge fixed. */
@@ -313,7 +427,54 @@ export function rectAreaSideBoundarySegments(
   side: RectAreaSide,
   points: readonly AreaPoint[]
 ): Array<{ x1: number; y1: number; x2: number; y2: number }> {
-  const bounds = rectBounds(points);
+  const polygonSignedArea = (poly: readonly AreaPoint[]): number => {
+    if (poly.length < 3) return 0;
+    let sum = 0;
+    for (let i = 0; i < poly.length; i++) {
+      const a = poly[i]!;
+      const b = poly[(i + 1) % poly.length]!;
+      sum += a.x * b.y - b.x * a.y;
+    }
+    return sum / 2;
+  };
+  const edgeSide = (poly: readonly AreaPoint[], edgeIndex: number): RectAreaSide | undefined => {
+    const len = poly.length;
+    const p = poly[edgeIndex];
+    const next = poly[(edgeIndex + 1) % len];
+    if (!p || !next) return undefined;
+
+    let dx = next.x - p.x;
+    let dy = next.y - p.y;
+
+    if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
+      for (let step = 1; step < len; step++) {
+        const prev = poly[(edgeIndex - step + len) % len];
+        const forward = poly[(edgeIndex + step) % len];
+        if (!prev || !forward) continue;
+        const runDx = forward.x - prev.x;
+        const runDy = forward.y - prev.y;
+        if (Math.abs(runDx) > RECT_AREA_EPSILON || Math.abs(runDy) > RECT_AREA_EPSILON) {
+          dx = runDx;
+          dy = runDy;
+          break;
+        }
+      }
+      if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
+        return undefined;
+      }
+    }
+
+    const areaSign = polygonSignedArea(poly);
+    const outward = areaSign >= 0
+      ? { x: dy, y: -dx }
+      : { x: -dy, y: dx };
+
+    if (Math.abs(outward.x) > Math.abs(outward.y)) {
+      return outward.x > 0 ? "right" : "left";
+    }
+    return outward.y > 0 ? "bottom" : "top";
+  };
+
   const segments: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
 
   for (let i = 0; i < points.length; i++) {
@@ -321,26 +482,17 @@ export function rectAreaSideBoundarySegments(
     const next = points[(i + 1) % points.length]!;
     const horizontal = Math.abs(p.y - next.y) < RECT_AREA_EPSILON;
     const vertical = Math.abs(p.x - next.x) < RECT_AREA_EPSILON;
-
-    if (side === "top" && horizontal && Math.abs(p.y - bounds.minY) < RECT_AREA_EPSILON) {
+    if (edgeSide(points, i) !== side) continue;
+    if (horizontal) {
       const x1 = Math.min(p.x, next.x);
       const x2 = Math.max(p.x, next.x);
-      segments.push({ x1, y1: bounds.minY, x2, y2: bounds.minY });
+      segments.push({ x1, y1: p.y, x2, y2: p.y });
+      continue;
     }
-    if (side === "bottom" && horizontal && Math.abs(p.y - bounds.maxY) < RECT_AREA_EPSILON) {
-      const x1 = Math.min(p.x, next.x);
-      const x2 = Math.max(p.x, next.x);
-      segments.push({ x1, y1: bounds.maxY, x2, y2: bounds.maxY });
-    }
-    if (side === "left" && vertical && Math.abs(p.x - bounds.minX) < RECT_AREA_EPSILON) {
+    if (vertical) {
       const y1 = Math.min(p.y, next.y);
       const y2 = Math.max(p.y, next.y);
-      segments.push({ x1: bounds.minX, y1, x2: bounds.minX, y2 });
-    }
-    if (side === "right" && vertical && Math.abs(p.x - bounds.maxX) < RECT_AREA_EPSILON) {
-      const y1 = Math.min(p.y, next.y);
-      const y2 = Math.max(p.y, next.y);
-      segments.push({ x1: bounds.maxX, y1, x2: bounds.maxX, y2 });
+      segments.push({ x1: p.x, y1, x2: p.x, y2 });
     }
   }
 

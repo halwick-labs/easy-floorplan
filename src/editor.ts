@@ -176,12 +176,14 @@ import {
   rectAreaClamp,
   rectAreaEdgeResize,
   rectAreaHasMinimumSize,
+  rectilinearAreaVertexResize,
   rectAreaVertexResize,
   RECT_AREA_EPSILON,
   rectAreaWallId,
   rectAreaSharedSides,
   rectAreaSideWalls,
   isRectArea,
+  isRectilinearArea,
   snapWallEnd,
   type AttachedCorner,
   type OrigPos,
@@ -424,6 +426,101 @@ function isTypingPath(path: EventTarget[]): boolean {
     );
   });
 }
+
+const EDITOR_DEBUG = true;
+const EDITOR_DEBUG_MAX_CHARS = 1600;
+const EDITOR_DEBUG_REPEAT_SUMMARY_EVERY = 20;
+const EDITOR_DEBUG_OMIT_KEYS = new Set([
+  "prev",
+  "next",
+  "moving",
+  "coupledAreas",
+  "sideWallLookup",
+  "area",
+  "updated",
+]);
+const EDITOR_DEBUG_LABEL_ALLOW = [
+  "_applyDrag:area-edge-before",
+  "_applyDrag:area-edge-after",
+  "_applyDrag:area-edge-reject",
+  "_toggleRectAreaSide:",
+  "_clickRectAreaSide:input",
+  "polygon-state:transition",
+  "sideWallInfoFor:miss",
+];
+const EDITOR_DEBUG_SAMPLE_EVERY = 8;
+let editorDebugSeq = 0;
+const editorDebugLogState = new Map<string, { text: string; count: number }>();
+
+function editorDebugAllowed(label: string): boolean {
+  return EDITOR_DEBUG_LABEL_ALLOW.some((prefix) => label.startsWith(prefix));
+}
+
+function editorDebugShouldSample(label: string): boolean {
+  if (label === "_applyDrag:area-edge-reject" || label === "polygon-state:transition") return true;
+  if (label === "_applyDrag:area-edge-before" || label === "_applyDrag:area-edge-after") {
+    editorDebugSeq += 1;
+    return editorDebugSeq % EDITOR_DEBUG_SAMPLE_EVERY === 0;
+  }
+  return true;
+}
+
+function editorDebugCompact(value: unknown, depth = 0): unknown {
+  if (value == null) return value;
+  if (typeof value === "bigint") return String(value);
+  if (typeof value !== "object") return value;
+  if (value instanceof Set) return `Set(${value.size})`;
+  if (value instanceof Map) return `Map(${value.size})`;
+
+  if (Array.isArray(value)) {
+    if (depth >= 2) return `Array(${value.length})`;
+    const sample = value.slice(0, 6).map((item) => editorDebugCompact(item, depth + 1));
+    if (value.length > 6) sample.push(`...(+${value.length - 6})`);
+    return sample;
+  }
+
+  const input = value as Record<string, unknown>;
+  const out: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (EDITOR_DEBUG_OMIT_KEYS.has(key)) {
+      out[key] = "[omitted]";
+      continue;
+    }
+    if (key === "points" && Array.isArray(raw)) {
+      out.points = `Array(${raw.length})`;
+      continue;
+    }
+    out[key] = depth >= 2 ? "[nested]" : editorDebugCompact(raw, depth + 1);
+  }
+  return out;
+}
+
+const serializeDebug = (value: unknown): string => {
+  const compact = editorDebugCompact(value);
+  const text = JSON.stringify(compact, null, 0);
+  if (!text) return String(compact);
+  if (text.length <= EDITOR_DEBUG_MAX_CHARS) return text;
+  return `${text.slice(0, EDITOR_DEBUG_MAX_CHARS)}... [truncated ${text.length - EDITOR_DEBUG_MAX_CHARS} chars]`;
+};
+const editorDebug = (label: string, value: unknown): void => {
+  if (!EDITOR_DEBUG) return;
+  if (!editorDebugAllowed(label)) return;
+  if (!editorDebugShouldSample(label)) return;
+  const text = serializeDebug(value);
+  const prev = editorDebugLogState.get(label);
+  if (prev && prev.text === text) {
+    prev.count += 1;
+    if (prev.count % EDITOR_DEBUG_REPEAT_SUMMARY_EVERY === 0) {
+      console.log(`[easy-floorplan:editor] ${label} (same payload repeated ${prev.count}x)`);
+    }
+    return;
+  }
+  if (prev && prev.count > 1) {
+    console.log(`[easy-floorplan:editor] ${label} (same payload repeated ${prev.count}x)`);
+  }
+  editorDebugLogState.set(label, { text, count: 1 });
+  console.log(`[easy-floorplan:editor] ${label}`, text);
+};
 
 @customElement("easy-floorplan-card-editor")
 export class FloorplanCardEditor extends LitElement {
@@ -739,6 +836,7 @@ export class FloorplanCardEditor extends LitElement {
       furniture: [],
       trackers: [],
     };
+    this._logPolygonStateIfChanged("setConfig", this._config);
     if (!this._activeFloorId || !floors.some((f) => f.id === this._activeFloorId)) {
       this._activeFloorId =
         base.defaultFloor && floors.some((f) => f.id === base.defaultFloor)
@@ -808,6 +906,7 @@ export class FloorplanCardEditor extends LitElement {
     // far longer than a frame. The canvas still follows the pointer: _config is
     // @state, so assigning it repaints the editor without involving the host.
     if (this._drag) {
+      this._logPolygonStateIfChanged("_emitFloor:drag", config);
       this._config = config;
       this._watchedEntities = collectWatchedEntities(config);
       this._dragDirty = true;
@@ -1151,9 +1250,39 @@ export class FloorplanCardEditor extends LitElement {
 
   /** The config most recently dispatched, to recognize HA's setConfig echo. */
   private _lastEmitted?: FloorplanCardConfig;
+  private _lastPolygonStateSignature?: string;
+  private _lastPolygonStateSnapshot?: unknown;
+
+  private _polygonStateSnapshot(config: FloorplanCardConfig): unknown {
+    return {
+      floors: (config.floors ?? []).map((floor) => ({
+        id: floor.id,
+        areas: (floor.areas ?? []).map((area) => ({
+          id: area.id,
+          points: area.points,
+          sideWalls: area.sideWalls,
+          locked: area.locked,
+        })),
+      })),
+    };
+  }
+
+  private _logPolygonStateIfChanged(reason: string, config: FloorplanCardConfig): void {
+    const nextSnapshot = this._polygonStateSnapshot(config);
+    const signature = JSON.stringify(nextSnapshot);
+    if (signature === this._lastPolygonStateSignature) return;
+    editorDebug("polygon-state:transition", {
+      reason,
+      previous: this._lastPolygonStateSnapshot,
+      next: nextSnapshot,
+    });
+    this._lastPolygonStateSignature = signature;
+    this._lastPolygonStateSnapshot = nextSnapshot;
+  }
 
   private _emit(config: FloorplanCardConfig): void {
     if (this._drag) this._drag.emitted = true;
+    this._logPolygonStateIfChanged("_emit", config);
     this._config = config;
     // Recompute here, not just in setConfig: real HA deep-equal-skips the
     // setConfig echo of our own emission, so entities bound during the
@@ -2112,6 +2241,8 @@ export class FloorplanCardEditor extends LitElement {
       const moving = (f.areas ?? []).find((a) => a.id === drag.primary.id)!;
       let points = isRectArea(moving.points)
         ? rectAreaVertexResize(moving.points, idx, target)
+        : isRectilinearArea(moving.points)
+          ? rectilinearAreaVertexResize(moving.points, idx, target)
         : moving.points.map((pt, i) => (i === idx ? target : pt));
       const delta = { dx: target.x - moving.points[idx]!.x, dy: target.y - moving.points[idx]!.y };
       const vertexSides: RectAreaSide[] = isRectArea(moving.points)
@@ -2143,12 +2274,24 @@ export class FloorplanCardEditor extends LitElement {
     // wall stays fixed, so the room can be pushed or pulled without moving the
     // whole shape.
     if (drag.primary.kind === "area" && drag.areaEdge != null) {
+      if (Math.hypot(p.x - drag.start.x, p.y - drag.start.y) <= RECT_AREA_EPSILON) return;
       const idx = drag.areaEdge;
       const target = { x: this._snap(p.x), y: this._snap(p.y) };
       const moving = (f.areas ?? []).find((a) => a.id === drag.primary.id)!;
       const edgeStart = moving.points[idx % moving.points.length]!;
       const edgeEnd = moving.points[(idx + 1) % moving.points.length]!;
       const horizontal = Math.abs(edgeStart.y - edgeEnd.y) < RECT_AREA_EPSILON;
+      editorDebug("_applyDrag:area-edge-before", {
+        areaId: moving.id,
+        edgeIndex: idx,
+        dragStart: drag.start,
+        pointer: p,
+        target,
+        moving,
+        edgeStart,
+        edgeEnd,
+        horizontal,
+      });
 
       let points: AreaPoint[];
       if (isRectArea(moving.points)) {
@@ -2188,7 +2331,21 @@ export class FloorplanCardEditor extends LitElement {
       if (isRectArea(sharedPoints)) {
         points = rectAreaClamp(sharedPoints, uncoupled, coupled.delta);
       }
+      editorDebug("_applyDrag:area-edge-after", {
+        areaId: moving.id,
+        edgeIndex: idx,
+        movingSide,
+        delta,
+        coupledIds: Array.from(coupled.coupledIds),
+        primaryPoints: points,
+        coupledAreas: coupled.areas,
+      });
       if (isRectArea(points) && !rectAreaHasMinimumSize(points)) {
+        editorDebug("_applyDrag:area-edge-reject", {
+          areaId: moving.id,
+          points,
+          message: "minimum size violation, floor unchanged",
+        });
         this._emitFloor({ areas: f.areas ?? [] });
         return;
       }
@@ -3863,9 +4020,9 @@ export class FloorplanCardEditor extends LitElement {
     const floors = c.floors ?? [];
     const generatedWallSegments = this._roomWallSegments(floor);
     const blockingWallSegments = wallsThatBlock([...floor.walls, ...generatedWallSegments]);
-    const sideWallLookup = new Map<string, { area: Area; side: RectAreaSide; edgeIndex: number; segmentIndex: number }>();
+    const sideWallLookup = new Map<string, { area: Area; side: RectAreaSide; segmentIndex: number }>();
     for (const area of floor.areas ?? []) {
-      for (const [edgeIndex, side] of RECT_AREA_SIDES.entries()) {
+      for (const side of RECT_AREA_SIDES) {
         const raw = area.sideWalls?.[side];
         const segments = rectAreaSideWallSegments(raw);
         if (!segments.length) continue;
@@ -3875,23 +4032,73 @@ export class FloorplanCardEditor extends LitElement {
           segments[0]!.start <= RECT_AREA_EPSILON &&
           segments[0]!.end >= 1 - RECT_AREA_EPSILON;
         if (keepLegacyId) {
-          sideWallLookup.set(baseId, { area, side, edgeIndex, segmentIndex: 0 });
+          sideWallLookup.set(baseId, { area, side, segmentIndex: 0 });
           continue;
         }
         for (let i = 0; i < segments.length; i++) {
-          const info = { area, side, edgeIndex, segmentIndex: i };
+          const info = { area, side, segmentIndex: i };
           sideWallLookup.set(`${baseId}-${i}`, info);
           if (i === 0) sideWallLookup.set(baseId, info);
         }
       }
     }
+    const sideWallEdgeIndexFor = (area: Area, side: RectAreaSide, wall: Wall): number => {
+      const points = area.points;
+      const matches = (edgeIndex: number): boolean => {
+        const a = points[edgeIndex];
+        const b = points[(edgeIndex + 1) % points.length];
+        if (!a || !b) return false;
+        if (side === "top" || side === "bottom") {
+          if (Math.abs(a.y - b.y) > RECT_AREA_EPSILON) return false;
+          if (Math.abs(a.y - wall.y1) > RECT_AREA_EPSILON || Math.abs(a.y - wall.y2) > RECT_AREA_EPSILON) return false;
+          const edgeStart = Math.min(a.x, b.x);
+          const edgeEnd = Math.max(a.x, b.x);
+          const wallStart = Math.min(wall.x1, wall.x2);
+          const wallEnd = Math.max(wall.x1, wall.x2);
+          return wallStart >= edgeStart - RECT_AREA_EPSILON && wallEnd <= edgeEnd + RECT_AREA_EPSILON;
+        }
+        if (Math.abs(a.x - b.x) > RECT_AREA_EPSILON) return false;
+        if (Math.abs(a.x - wall.x1) > RECT_AREA_EPSILON || Math.abs(a.x - wall.x2) > RECT_AREA_EPSILON) return false;
+        const edgeStart = Math.min(a.y, b.y);
+        const edgeEnd = Math.max(a.y, b.y);
+        const wallStart = Math.min(wall.y1, wall.y2);
+        const wallEnd = Math.max(wall.y1, wall.y2);
+        return wallStart >= edgeStart - RECT_AREA_EPSILON && wallEnd <= edgeEnd + RECT_AREA_EPSILON;
+      };
+
+      const direct = points.findIndex((_, i) => matches(i));
+      if (direct >= 0) return direct;
+
+      const bySide = points.findIndex((_, i) => this._rectAreaEdgeSide(area, i) === side);
+      if (bySide >= 0) return bySide;
+
+      return RECT_AREA_SIDES.indexOf(side);
+    };
     const sideWallInfoFor = (wall: Wall) => {
       const exact = sideWallLookup.get(wall.id);
-      if (exact) return exact;
-      if (!wall.id.startsWith("area-wall-")) return undefined;
-      for (const [key, info] of sideWallLookup) {
-        if (wall.id === key || wall.id.startsWith(`${key}-`)) return info;
+      if (exact) {
+        const resolved = { ...exact, edgeIndex: sideWallEdgeIndexFor(exact.area, exact.side, wall) };
+        editorDebug("sideWallInfoFor:exact", { wallId: wall.id, info: resolved });
+        return resolved;
       }
+      if (!wall.id.startsWith("area-wall-")) {
+        editorDebug("sideWallInfoFor:non-area-wall", { wallId: wall.id });
+        return undefined;
+      }
+      for (const [key, info] of sideWallLookup) {
+        if (wall.id === key) {
+          const resolved = { ...info, edgeIndex: sideWallEdgeIndexFor(info.area, info.side, wall) };
+          editorDebug("sideWallInfoFor:lookup-key-match", { wallId: wall.id, key, info: resolved });
+          return resolved;
+        }
+        const segmentKey = `${key}-${info.segmentIndex}`;
+        if (wall.id === segmentKey || wall.id.startsWith(`${segmentKey}-`)) {
+          const resolved = { ...info, edgeIndex: sideWallEdgeIndexFor(info.area, info.side, wall) };
+          editorDebug("sideWallInfoFor:segment-match", { wallId: wall.id, key, segmentKey, info: resolved });
+          return resolved;
+        }
+      }
+      editorDebug("sideWallInfoFor:miss", { wallId: wall.id, sideWallLookup: Array.from(sideWallLookup.entries()) });
       return undefined;
     };
     // How the card will size this plan's badges and labels. The canvas honours
@@ -5362,9 +5569,39 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _toggleRectAreaSide(a: Area, edgeIndex: number, ev?: PointerEvent): void {
-    const clickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
-    const updated = toggleRectAreaSide(a, edgeIndex, clickT);
-    if (updated) this._updateArea(a.id, { sideWalls: updated.sideWalls });
+    const side = this._rectAreaEdgeSide(a, edgeIndex);
+    const interval = this._edgeIntervalOnSideBoundary(a, side, edgeIndex);
+    if (!interval) {
+      editorDebug("_toggleRectAreaSide:skip-non-boundary-edge", {
+        areaId: a.id,
+        edgeIndex,
+        side,
+        points: a.points,
+      });
+      return;
+    }
+    const localClickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
+    const clickT = interval.start + (interval.end - interval.start) * localClickT;
+    editorDebug("_toggleRectAreaSide:before", {
+      areaId: a.id,
+      edgeIndex,
+      localClickT,
+      clickT,
+      interval,
+      side,
+      area: a,
+    });
+    const updated = toggleRectAreaSide(a, edgeIndex, clickT, interval);
+    if (updated) {
+      editorDebug("_toggleRectAreaSide:after", {
+        areaId: a.id,
+        edgeIndex,
+        before: a.sideWalls,
+        after: updated.sideWalls,
+        updated,
+      });
+      this._updateArea(a.id, { sideWalls: updated.sideWalls });
+    }
   }
 
   private _rectAreaEdgeFraction(a: Area, edgeIndex: number, ev?: PointerEvent): number {
@@ -5374,7 +5611,12 @@ export class FloorplanCardEditor extends LitElement {
   }
 
   private _splitRectAreaSide(a: Area, edgeIndex: number, ev: PointerEvent): void {
-    const clickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
+    const side = this._rectAreaEdgeSide(a, edgeIndex);
+    const interval = this._edgeIntervalOnSideBoundary(a, side, edgeIndex);
+    const localClickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
+    const clickT = interval
+      ? interval.start + (interval.end - interval.start) * localClickT
+      : localClickT;
     const updated = splitRectAreaSide(a, edgeIndex, clickT, !(ev.clientX === 0 && ev.clientY === 0));
     if (updated) this._updateArea(a.id, { sideWalls: updated.sideWalls });
   }
@@ -5395,14 +5637,31 @@ export class FloorplanCardEditor extends LitElement {
     ev.stopPropagation();
     const side = this._rectAreaEdgeSide(a, edgeIndex);
     const current = a.sideWalls?.[side];
-    const hasWallOrDivider = typeof current === "string"
-      ? current !== "none"
-      : Array.isArray(current) && rectAreaSideWallSegments(current).length > 0;
+    const interval = this._edgeIntervalOnSideBoundary(a, side, edgeIndex);
+    const localClickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
+    const clickT = interval
+      ? interval.start + (interval.end - interval.start) * localClickT
+      : localClickT;
+    const edgeSideState = this._rectAreaEdgeSideState(a, edgeIndex);
+    editorDebug("_clickRectAreaSide:input", {
+      areaId: a.id,
+      edgeIndex,
+      side,
+      interval,
+      localClickT,
+      clickT,
+      current,
+      edgeSideState,
+      sideWalls: a.sideWalls,
+      ctrl: ev.ctrlKey,
+      meta: ev.metaKey,
+      shift: ev.shiftKey,
+    });
+    const hasWallOrDivider = edgeSideState === "wall" || edgeSideState === "divider";
     if (ev.ctrlKey || ev.metaKey) {
       this._splitRectAreaSide(a, edgeIndex, ev);
       const updated = (this._floor().areas ?? []).find((candidate) => candidate.id === a.id);
       const segments = rectAreaSideWallSegments(updated?.sideWalls?.[side]);
-      const clickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
       const selectedIndex = segments.findIndex(
         (segment) => clickT >= segment.start - RECT_AREA_EPSILON && clickT <= segment.end + RECT_AREA_EPSILON
       );
@@ -5424,6 +5683,99 @@ export class FloorplanCardEditor extends LitElement {
     if (ev.shiftKey) {
       this._mergeRectAreaSide(a, edgeIndex);
     }
+  }
+
+  private _edgeIntervalOnSideBoundary(
+    area: Area,
+    side: RectAreaSide,
+    edgeIndex: number
+  ): { start: number; end: number } | undefined {
+    const points = area.points;
+    const p = points[edgeIndex];
+    const next = points[(edgeIndex + 1) % points.length];
+    if (!p || !next) return undefined;
+
+    const sideBounds = rectAreaSideBoundarySegments(side, points);
+    if (!sideBounds.length) return undefined;
+    const totalLength = sideBounds.reduce((sum, bound) => {
+      if (side === "top" || side === "bottom") return sum + Math.abs(bound.x2 - bound.x1);
+      return sum + Math.abs(bound.y2 - bound.y1);
+    }, 0);
+    if (totalLength <= RECT_AREA_EPSILON) return undefined;
+
+    let cursor = 0;
+    for (const bound of sideBounds) {
+      const length =
+        side === "top" || side === "bottom"
+          ? Math.abs(bound.x2 - bound.x1)
+          : Math.abs(bound.y2 - bound.y1);
+      if (length <= RECT_AREA_EPSILON) {
+        continue;
+      }
+
+      if (side === "top" || side === "bottom") {
+        if (Math.abs(p.y - next.y) > RECT_AREA_EPSILON) {
+          cursor += length;
+          continue;
+        }
+        if (Math.abs(p.y - bound.y1) > RECT_AREA_EPSILON || Math.abs(next.y - bound.y2) > RECT_AREA_EPSILON) {
+          cursor += length;
+          continue;
+        }
+        const edgeStart = Math.min(p.x, next.x);
+        const edgeEnd = Math.max(p.x, next.x);
+        const boundStart = Math.min(bound.x1, bound.x2);
+        const boundEnd = Math.max(bound.x1, bound.x2);
+        const overlapStart = Math.max(edgeStart, boundStart);
+        const overlapEnd = Math.min(edgeEnd, boundEnd);
+        if (overlapEnd - overlapStart > RECT_AREA_EPSILON) {
+          return {
+            start: (cursor + (overlapStart - boundStart)) / totalLength,
+            end: (cursor + (overlapEnd - boundStart)) / totalLength,
+          };
+        }
+      } else {
+        if (Math.abs(p.x - next.x) > RECT_AREA_EPSILON) {
+          cursor += length;
+          continue;
+        }
+        if (Math.abs(p.x - bound.x1) > RECT_AREA_EPSILON || Math.abs(next.x - bound.x2) > RECT_AREA_EPSILON) {
+          cursor += length;
+          continue;
+        }
+        const edgeStart = Math.min(p.y, next.y);
+        const edgeEnd = Math.max(p.y, next.y);
+        const boundStart = Math.min(bound.y1, bound.y2);
+        const boundEnd = Math.max(bound.y1, bound.y2);
+        const overlapStart = Math.max(edgeStart, boundStart);
+        const overlapEnd = Math.min(edgeEnd, boundEnd);
+        if (overlapEnd - overlapStart > RECT_AREA_EPSILON) {
+          return {
+            start: (cursor + (overlapStart - boundStart)) / totalLength,
+            end: (cursor + (overlapEnd - boundStart)) / totalLength,
+          };
+        }
+      }
+
+      cursor += length;
+    }
+
+    return undefined;
+  }
+
+  private _rectAreaEdgeSideState(a: Area, edgeIndex: number): "wall" | "divider" | undefined {
+    const side = this._rectAreaEdgeSide(a, edgeIndex);
+    const interval = this._edgeIntervalOnSideBoundary(a, side, edgeIndex);
+    if (!interval) return undefined;
+
+    const segments = rectAreaSideWallSegments(a.sideWalls?.[side]);
+    const seg = segments.find((segment) => {
+      const start = Math.max(segment.start, interval.start);
+      const end = Math.min(segment.end, interval.end);
+      return end - start > RECT_AREA_EPSILON;
+    });
+    if (!seg || seg.state === "none") return undefined;
+    return seg.state;
   }
 
   private _rectAreaEdgeModifierClass(a: Area, edgeIndex: number): string {
@@ -5515,7 +5867,7 @@ export class FloorplanCardEditor extends LitElement {
                         const mid = { x: (p.x + next.x) / 2, y: (p.y + next.y) / 2 };
                         const isHorizontal = Math.abs(p.y - next.y) < RECT_AREA_EPSILON;
                         const side = this._rectAreaEdgeSide(a, i);
-                        const sideState = a.sideWalls?.[side];
+                        const sideState = this._rectAreaEdgeSideState(a, i);
                         const modifierClass = this._rectAreaEdgeModifierClass(a, i);
                         const cursor = this._rectAreaEdgeCursor(a, i, modifierClass);
                         return svg`
@@ -5529,7 +5881,7 @@ export class FloorplanCardEditor extends LitElement {
                               isHorizontal ? "ns" : "ew",
                               modifierClass,
                               sideState ? "side-wall-toggle" : "",
-                              typeof sideState === "string" ? sideState : "",
+                              sideState ?? "",
                             ]
                               .filter(Boolean)
                               .join(" ")}
