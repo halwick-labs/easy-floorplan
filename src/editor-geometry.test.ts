@@ -15,9 +15,12 @@ import {
   cyclePick,
   rectAreaPoints,
   rectAreaVertexResize,
+  rectilinearAreaVertexResize,
   rectAreaEdgeResize,
   rectAreaHasMinimumSize,
+  isRectilinearArea,
   rectAreaSideWalls,
+  rectAreaSideBoundarySegments,
   rectAreaSideWallNext,
   rectAreaClamp,
   rectAreaSharedEdgeCouple,
@@ -364,6 +367,60 @@ describe("rectAreaVertexResize", () => {
       { x: 25, y: 25 },
       { x: 0, y: 25 },
     ]);
+  });
+});
+
+describe("isRectilinearArea", () => {
+  it("accepts an L-shape and rejects a diagonal polygon", () => {
+    expect(isRectilinearArea([
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 200 },
+      { x: 200, y: 200 },
+      { x: 200, y: 300 },
+      { x: 100, y: 300 },
+    ])).toBe(true);
+
+    expect(isRectilinearArea([
+      { x: 100, y: 100 },
+      { x: 220, y: 100 },
+      { x: 220, y: 220 },
+      { x: 150, y: 150 },
+      { x: 100, y: 220 },
+    ])).toBe(false);
+  });
+});
+
+describe("rectilinearAreaVertexResize", () => {
+  it("moves adjacent vertices so an L-shape corner drag stays orthogonal", () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 200 },
+      { x: 200, y: 200 },
+      { x: 200, y: 300 },
+      { x: 100, y: 300 },
+    ];
+    expect(rectilinearAreaVertexResize(points, 0, { x: 80, y: 70 })).toEqual([
+      { x: 80, y: 70 },
+      { x: 300, y: 70 },
+      { x: 300, y: 200 },
+      { x: 200, y: 200 },
+      { x: 200, y: 300 },
+      { x: 80, y: 300 },
+    ]);
+  });
+
+  it("keeps the original shape when a corner drag would self-intersect", () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 200 },
+      { x: 200, y: 200 },
+      { x: 200, y: 300 },
+      { x: 100, y: 300 },
+    ];
+    expect(rectilinearAreaVertexResize(points, 0, { x: 250, y: 150 })).toEqual(points);
   });
 });
 
@@ -780,6 +837,38 @@ describe("rectAreaSideWalls", () => {
     const pts = [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }];
     expect(rectAreaSideWalls("kitchen", pts, { top: "wall" })[0]?.id).toBe("area-wall-kitchen-top");
     expect(rectAreaSideWalls("hall", pts, { top: "wall" })[0]?.id).toBe("area-wall-hall-top");
+  });
+});
+
+describe("rectAreaSideBoundarySegments", () => {
+  it("classifies concave L-shape recess edges by outward side", () => {
+    const l = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 200 },
+      { x: 200, y: 200 },
+      { x: 200, y: 300 },
+      { x: 100, y: 300 },
+    ];
+
+    const top = rectAreaSideBoundarySegments("top", l);
+    const right = rectAreaSideBoundarySegments("right", l);
+    const bottom = rectAreaSideBoundarySegments("bottom", l);
+    const left = rectAreaSideBoundarySegments("left", l);
+
+    expect(top).toEqual([{ x1: 100, y1: 100, x2: 300, y2: 100 }]);
+    expect(right).toEqual([
+      { x1: 300, y1: 100, x2: 300, y2: 200 },
+      { x1: 200, y1: 200, x2: 200, y2: 300 },
+    ]);
+    expect(bottom).toHaveLength(2);
+    expect(bottom).toEqual(expect.arrayContaining([
+      { x1: 200, y1: 200, x2: 300, y2: 200 },
+      { x1: 100, y1: 300, x2: 200, y2: 300 },
+    ]));
+    expect(left).toHaveLength(1);
+    expect(left[0]).toMatchObject({ x1: 100, x2: 100 });
+    expect([left[0]!.y1, left[0]!.y2].sort((a, b) => a - b)).toEqual([100, 300]);
   });
 });
 
