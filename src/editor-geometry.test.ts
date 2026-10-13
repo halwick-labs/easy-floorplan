@@ -488,6 +488,17 @@ describe("rectAreaClamp", () => {
       { x: 0, y: 10 },
     ]);
   });
+
+  it("falls back to the wider axis when called with no movement direction (the default delta)", () => {
+    const moving = [{ x: 0, y: 0 }, { x: 40, y: 0 }, { x: 40, y: 10 }, { x: 0, y: 10 }];
+    const other: Area[] = [{ id: "other", points: [{ x: 20, y: 0 }, { x: 60, y: 0 }, { x: 60, y: 10 }, { x: 20, y: 10 }] }];
+    expect(rectAreaClamp(moving, other)).toEqual([
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 10 },
+      { x: 0, y: 10 },
+    ]);
+  });
 });
 
 describe("rectAreaSharedSides", () => {

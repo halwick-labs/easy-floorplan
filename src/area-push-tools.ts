@@ -7,7 +7,7 @@ import {
   rectAreaSharedEdgeCouple,
 } from "./editor-geometry";
 
-const AREA_GEOMETRY_DEBUG = true;
+const AREA_GEOMETRY_DEBUG = false;
 const AREA_GEOMETRY_DEBUG_MAX_CHARS = 1400;
 const AREA_GEOMETRY_REPEAT_SUMMARY_EVERY = 50;
 const AREA_GEOMETRY_LABEL_ALLOW = [
@@ -235,6 +235,11 @@ export function coupleSharedBoundarySegment(
       : (movingSide === "bottom" ? bounds.maxY : bounds.minY)
   );
   const otherBoundary = primaryBoundary;
+  // The neighbour's shared edge is expected to sit at exactly `primaryBoundary`
+  // (areas only couple across an exact, pre-move shared wall) — no epsilon
+  // search for a near-but-not-exact coordinate. `boundaryIntervals` below
+  // simply returns no intervals when that doesn't hold, so a near-miss
+  // silently couples nothing rather than erroring.
   const boundaryIntervals = (
     poly: readonly AreaPoint[],
     boundary: number
@@ -421,6 +426,14 @@ export function coupleRectAreaSharedEdges(
   };
 }
 
+/**
+ * Binary-searches down to the largest fraction of `delta` (18 iterations,
+ * i.e. error under 1/2^18 of the requested move) that keeps every area in
+ * the coupled component clear of its neighbors — called on every pointer-move
+ * frame while dragging a coupled edge, each iteration re-running
+ * `coupleRectAreaSharedEdges` plus an O(areas^2) collision check. Fine for
+ * the handful of areas a floorplan typically has.
+ */
 export function coupledEdgeResize(
   primaryId: string,
   moving: Area,

@@ -1,24 +1,17 @@
-import { 
-  WALL_THICKNESS, 
-  pointInPolygon, 
-  polygonCentroid, 
-  textLabel, 
-  skylightWidth 
-} from "./render";
-import { 
-  AreaPoint, 
-  Area, 
-  RectAreaSide, 
+import { WALL_THICKNESS, pointInPolygon, polygonCentroid, textLabel, openingHitSize } from "./render";
+import type {
+  AreaPoint,
+  Area,
+  RectAreaSide,
   RectAreaSideWallState,
   RectAreaSideWallValue,
   RectAreaSideWallSegment,
-  RectAreaSideWalls, 
-  Wall, 
-  RECT_AREA_SIDES, 
-  Floor, 
-  RenderHass, 
-  openingIsSkylight 
+  RectAreaSideWalls,
+  Wall,
+  Floor,
+  RenderHass,
 } from "./types";
+import { RECT_AREA_SIDES } from "./types";
 
 export const RECT_AREA_EPSILON = 0.001;
 
@@ -266,6 +259,8 @@ export function rectAreaClamp(
     } else if (delta.dy < 0) {
       box = { ...box, minY: Math.max(box.minY, otherBox.maxY) };
     } else if (width >= height) {
+      // No movement direction to clamp against (e.g. the default `delta`):
+      // fall back to pushing the box out along its longer axis.
       if (box.minX < otherBox.maxX) box = { ...box, maxX: otherBox.minX };
       else box = { ...box, minX: otherBox.maxX };
     } else {
@@ -423,58 +418,55 @@ export function rectAreaSideWallSegments(
     .sort((a, b) => a.start - b.start);
 }
 
+/**
+ * Which rectilinear side an edge faces, by its outward normal — or
+ * `undefined` for a degenerate (zero-length) edge with no run of non-
+ * degenerate neighbors to borrow a direction from. Shared by
+ * `rectAreaSideBoundarySegments` here and `rectAreaEdgeSide` in
+ * area-tools.ts, which falls back to a side guess instead of `undefined`.
+ */
+export function polygonEdgeSide(poly: readonly AreaPoint[], edgeIndex: number): RectAreaSide | undefined {
+  const len = poly.length;
+  const p = poly[edgeIndex];
+  const next = poly[(edgeIndex + 1) % len];
+  if (!p || !next) return undefined;
+
+  let dx = next.x - p.x;
+  let dy = next.y - p.y;
+
+  if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
+    for (let step = 1; step < len; step++) {
+      const prev = poly[(edgeIndex - step + len) % len];
+      const forward = poly[(edgeIndex + step) % len];
+      if (!prev || !forward) continue;
+      const runDx = forward.x - prev.x;
+      const runDy = forward.y - prev.y;
+      if (Math.abs(runDx) > RECT_AREA_EPSILON || Math.abs(runDy) > RECT_AREA_EPSILON) {
+        dx = runDx;
+        dy = runDy;
+        break;
+      }
+    }
+    if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
+      return undefined;
+    }
+  }
+
+  const areaSign = polygonSignedArea(poly);
+  const outward = areaSign >= 0
+    ? { x: dy, y: -dx }
+    : { x: -dy, y: dx };
+
+  if (Math.abs(outward.x) > Math.abs(outward.y)) {
+    return outward.x > 0 ? "right" : "left";
+  }
+  return outward.y > 0 ? "bottom" : "top";
+}
+
 export function rectAreaSideBoundarySegments(
   side: RectAreaSide,
   points: readonly AreaPoint[]
 ): Array<{ x1: number; y1: number; x2: number; y2: number }> {
-  const polygonSignedArea = (poly: readonly AreaPoint[]): number => {
-    if (poly.length < 3) return 0;
-    let sum = 0;
-    for (let i = 0; i < poly.length; i++) {
-      const a = poly[i]!;
-      const b = poly[(i + 1) % poly.length]!;
-      sum += a.x * b.y - b.x * a.y;
-    }
-    return sum / 2;
-  };
-  const edgeSide = (poly: readonly AreaPoint[], edgeIndex: number): RectAreaSide | undefined => {
-    const len = poly.length;
-    const p = poly[edgeIndex];
-    const next = poly[(edgeIndex + 1) % len];
-    if (!p || !next) return undefined;
-
-    let dx = next.x - p.x;
-    let dy = next.y - p.y;
-
-    if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
-      for (let step = 1; step < len; step++) {
-        const prev = poly[(edgeIndex - step + len) % len];
-        const forward = poly[(edgeIndex + step) % len];
-        if (!prev || !forward) continue;
-        const runDx = forward.x - prev.x;
-        const runDy = forward.y - prev.y;
-        if (Math.abs(runDx) > RECT_AREA_EPSILON || Math.abs(runDy) > RECT_AREA_EPSILON) {
-          dx = runDx;
-          dy = runDy;
-          break;
-        }
-      }
-      if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
-        return undefined;
-      }
-    }
-
-    const areaSign = polygonSignedArea(poly);
-    const outward = areaSign >= 0
-      ? { x: dy, y: -dx }
-      : { x: -dy, y: dx };
-
-    if (Math.abs(outward.x) > Math.abs(outward.y)) {
-      return outward.x > 0 ? "right" : "left";
-    }
-    return outward.y > 0 ? "bottom" : "top";
-  };
-
   const segments: Array<{ x1: number; y1: number; x2: number; y2: number }> = [];
 
   for (let i = 0; i < points.length; i++) {
@@ -482,7 +474,7 @@ export function rectAreaSideBoundarySegments(
     const next = points[(i + 1) % points.length]!;
     const horizontal = Math.abs(p.y - next.y) < RECT_AREA_EPSILON;
     const vertical = Math.abs(p.x - next.x) < RECT_AREA_EPSILON;
-    if (edgeSide(points, i) !== side) continue;
+    if (polygonEdgeSide(points, i) !== side) continue;
     if (horizontal) {
       const x1 = Math.min(p.x, next.x);
       const x2 = Math.max(p.x, next.x);
@@ -561,9 +553,9 @@ export function rectAreaSideWalls(
         cursor = boundEnd;
       }
 
-      pieces.forEach((piece) => {
+      pieces.forEach((piece, pieceIndex) => {
         const keepLegacyId = segments.length === 1 && segment.start === 0 && segment.end === 1 && pieces.length === 1;
-        const id = keepLegacyId ? rectAreaWallId(areaId, side) : `${rectAreaWallId(areaId, side)}-${index}${pieces.length > 1 ? `-${pieces.indexOf(piece)}` : ""}`;
+        const id = keepLegacyId ? rectAreaWallId(areaId, side) : `${rectAreaWallId(areaId, side)}-${index}${pieces.length > 1 ? `-${pieceIndex}` : ""}`;
         out.push({
           id,
           ...piece,
@@ -962,7 +954,7 @@ export function elementsAtPoint(
     // drawn in, so the skylight could not be selected or dragged at all. The
     // same trap the text labels above hit in #225; `openingHitSize` is the
     // rectangle the editor overlay and the card already use.
-    const halfDepth = openingIsSkylight(o) ? skylightWidth(o) / 2 : opts.wallThickness / 2;
+    const halfDepth = openingHitSize(o).height / 2;
     const p = toLocal(x, y, o.x, o.y, o.angle ?? 0);
     if (Math.abs(p.x) <= o.length / 2 && Math.abs(p.y) <= halfDepth + HIT.pad) {
       push("opening", o.id, i, o.locked);
