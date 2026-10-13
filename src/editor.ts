@@ -212,6 +212,7 @@ import {
   applyAreaWallSegmentDrag,
   removeAreaWallSegment,
 } from "./area-wall-segment-tools";
+import { createDebugLogger } from "./debug";
 import {
   furnitureChoices,
   furnitureLabel,
@@ -427,100 +428,33 @@ function isTypingPath(path: EventTarget[]): boolean {
   });
 }
 
-const EDITOR_DEBUG = true;
-const EDITOR_DEBUG_MAX_CHARS = 1600;
-const EDITOR_DEBUG_REPEAT_SUMMARY_EVERY = 20;
-const EDITOR_DEBUG_OMIT_KEYS = new Set([
-  "prev",
-  "next",
-  "moving",
-  "coupledAreas",
-  "sideWallLookup",
-  "area",
-  "updated",
-]);
-const EDITOR_DEBUG_LABEL_ALLOW = [
-  "_applyDrag:area-edge-before",
-  "_applyDrag:area-edge-after",
-  "_applyDrag:area-edge-reject",
-  "_toggleRectAreaSide:",
-  "_clickRectAreaSide:input",
-  "polygon-state:transition",
-  "sideWallInfoFor:miss",
-];
-const EDITOR_DEBUG_SAMPLE_EVERY = 8;
 let editorDebugSeq = 0;
-const editorDebugLogState = new Map<string, { text: string; count: number }>();
-
-function editorDebugAllowed(label: string): boolean {
-  return EDITOR_DEBUG_LABEL_ALLOW.some((prefix) => label.startsWith(prefix));
-}
-
-function editorDebugShouldSample(label: string): boolean {
-  if (label === "_applyDrag:area-edge-reject" || label === "polygon-state:transition") return true;
-  if (label === "_applyDrag:area-edge-before" || label === "_applyDrag:area-edge-after") {
-    editorDebugSeq += 1;
-    return editorDebugSeq % EDITOR_DEBUG_SAMPLE_EVERY === 0;
-  }
-  return true;
-}
-
-function editorDebugCompact(value: unknown, depth = 0): unknown {
-  if (value == null) return value;
-  if (typeof value === "bigint") return String(value);
-  if (typeof value !== "object") return value;
-  if (value instanceof Set) return `Set(${value.size})`;
-  if (value instanceof Map) return `Map(${value.size})`;
-
-  if (Array.isArray(value)) {
-    if (depth >= 2) return `Array(${value.length})`;
-    const sample = value.slice(0, 6).map((item) => editorDebugCompact(item, depth + 1));
-    if (value.length > 6) sample.push(`...(+${value.length - 6})`);
-    return sample;
-  }
-
-  const input = value as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const [key, raw] of Object.entries(input)) {
-    if (EDITOR_DEBUG_OMIT_KEYS.has(key)) {
-      out[key] = "[omitted]";
-      continue;
+/** Sample every Nth call for the noisy, per-frame area-edge drag labels. */
+const EDITOR_DEBUG_SAMPLE_EVERY = 8;
+const editorDebug = createDebugLogger("editor", {
+  enabled: false,
+  maxChars: 1600,
+  repeatSummaryEvery: 20,
+  labelAllow: [
+    "_applyDrag:area-edge-before",
+    "_applyDrag:area-edge-after",
+    "_applyDrag:area-edge-reject",
+    "_toggleRectAreaSide:",
+    "_clickRectAreaSide:input",
+    "polygon-state:transition",
+    "sideWallInfoFor:miss",
+  ],
+  omitKeys: ["prev", "next", "moving", "coupledAreas", "sideWallLookup", "area", "updated"],
+  arrayLengthKeys: ["points"],
+  shouldLog: (label) => {
+    if (label === "_applyDrag:area-edge-reject" || label === "polygon-state:transition") return true;
+    if (label === "_applyDrag:area-edge-before" || label === "_applyDrag:area-edge-after") {
+      editorDebugSeq += 1;
+      return editorDebugSeq % EDITOR_DEBUG_SAMPLE_EVERY === 0;
     }
-    if (key === "points" && Array.isArray(raw)) {
-      out.points = `Array(${raw.length})`;
-      continue;
-    }
-    out[key] = depth >= 2 ? "[nested]" : editorDebugCompact(raw, depth + 1);
-  }
-  return out;
-}
-
-const serializeDebug = (value: unknown): string => {
-  const compact = editorDebugCompact(value);
-  const text = JSON.stringify(compact, null, 0);
-  if (!text) return String(compact);
-  if (text.length <= EDITOR_DEBUG_MAX_CHARS) return text;
-  return `${text.slice(0, EDITOR_DEBUG_MAX_CHARS)}... [truncated ${text.length - EDITOR_DEBUG_MAX_CHARS} chars]`;
-};
-const editorDebug = (label: string, value: unknown): void => {
-  if (!EDITOR_DEBUG) return;
-  if (!editorDebugAllowed(label)) return;
-  if (!editorDebugShouldSample(label)) return;
-  const text = serializeDebug(value);
-  const prev = editorDebugLogState.get(label);
-  if (prev && prev.text === text) {
-    prev.count += 1;
-    if (prev.count % EDITOR_DEBUG_REPEAT_SUMMARY_EVERY === 0) {
-      console.log(`[easy-floorplan:editor] ${label} (same payload repeated ${prev.count}x)`);
-    }
-    return;
-  }
-  if (prev && prev.count > 1) {
-    console.log(`[easy-floorplan:editor] ${label} (same payload repeated ${prev.count}x)`);
-  }
-  editorDebugLogState.set(label, { text, count: 1 });
-  console.log(`[easy-floorplan:editor] ${label}`, text);
-};
+    return true;
+  },
+});
 
 @customElement("easy-floorplan-card-editor")
 export class FloorplanCardEditor extends LitElement {
@@ -5581,7 +5515,7 @@ export class FloorplanCardEditor extends LitElement {
       return;
     }
     const localClickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
-    const clickT = interval.start + (interval.end - interval.start) * localClickT;
+    const clickT = interval.start + (interval.end - interval.start) * this._edgeAscendingFraction(a, edgeIndex, side, localClickT);
     editorDebug("_toggleRectAreaSide:before", {
       areaId: a.id,
       edgeIndex,
@@ -5610,12 +5544,29 @@ export class FloorplanCardEditor extends LitElement {
     return rectAreaEdgeFraction(a, edgeIndex, this._toVirtual(ev, false));
   }
 
+  /**
+   * `localClickT` (from {@link _rectAreaEdgeFraction}) runs from this edge's
+   * own start vertex to its end vertex; `_edgeIntervalOnSideBoundary`'s
+   * interval always runs in ascending x (top/bottom) or ascending y
+   * (left/right), regardless of winding. The two agree only when the edge
+   * happens to run the same way — on a clockwise rectangle that's true for
+   * top/right but false for bottom/left, so combining them unflipped placed
+   * a click's result mirrored across the edge's midpoint on those sides.
+   */
+  private _edgeAscendingFraction(a: Area, edgeIndex: number, side: RectAreaSide, localClickT: number): number {
+    const p = a.points[edgeIndex];
+    const next = a.points[(edgeIndex + 1) % a.points.length];
+    if (!p || !next) return localClickT;
+    const ascending = side === "top" || side === "bottom" ? next.x >= p.x : next.y >= p.y;
+    return ascending ? localClickT : 1 - localClickT;
+  }
+
   private _splitRectAreaSide(a: Area, edgeIndex: number, ev: PointerEvent): void {
     const side = this._rectAreaEdgeSide(a, edgeIndex);
     const interval = this._edgeIntervalOnSideBoundary(a, side, edgeIndex);
     const localClickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
     const clickT = interval
-      ? interval.start + (interval.end - interval.start) * localClickT
+      ? interval.start + (interval.end - interval.start) * this._edgeAscendingFraction(a, edgeIndex, side, localClickT)
       : localClickT;
     const updated = splitRectAreaSide(a, edgeIndex, clickT, !(ev.clientX === 0 && ev.clientY === 0));
     if (updated) this._updateArea(a.id, { sideWalls: updated.sideWalls });
@@ -5640,7 +5591,7 @@ export class FloorplanCardEditor extends LitElement {
     const interval = this._edgeIntervalOnSideBoundary(a, side, edgeIndex);
     const localClickT = this._rectAreaEdgeFraction(a, edgeIndex, ev);
     const clickT = interval
-      ? interval.start + (interval.end - interval.start) * localClickT
+      ? interval.start + (interval.end - interval.start) * this._edgeAscendingFraction(a, edgeIndex, side, localClickT)
       : localClickT;
     const edgeSideState = this._rectAreaEdgeSideState(a, edgeIndex);
     editorDebug("_clickRectAreaSide:input", {
@@ -5697,64 +5648,47 @@ export class FloorplanCardEditor extends LitElement {
 
     const sideBounds = rectAreaSideBoundarySegments(side, points);
     if (!sideBounds.length) return undefined;
-    const totalLength = sideBounds.reduce((sum, bound) => {
-      if (side === "top" || side === "bottom") return sum + Math.abs(bound.x2 - bound.x1);
-      return sum + Math.abs(bound.y2 - bound.y1);
-    }, 0);
+
+    // top/bottom bounds run along x; left/right run along y — picking the
+    // axis up front lets the rest of this method read the same either way.
+    const horizontal = side === "top" || side === "bottom";
+    const boundLength = (bound: { x1: number; y1: number; x2: number; y2: number }): number =>
+      horizontal ? Math.abs(bound.x2 - bound.x1) : Math.abs(bound.y2 - bound.y1);
+
+    const totalLength = sideBounds.reduce((sum, bound) => sum + boundLength(bound), 0);
     if (totalLength <= RECT_AREA_EPSILON) return undefined;
+
+    // This edge doesn't even run along `side`'s axis, so it can't be on any
+    // of its boundary segments.
+    const edgeAlongAxis = horizontal
+      ? Math.abs(p.y - next.y) <= RECT_AREA_EPSILON
+      : Math.abs(p.x - next.x) <= RECT_AREA_EPSILON;
+    if (!edgeAlongAxis) return undefined;
 
     let cursor = 0;
     for (const bound of sideBounds) {
-      const length =
-        side === "top" || side === "bottom"
-          ? Math.abs(bound.x2 - bound.x1)
-          : Math.abs(bound.y2 - bound.y1);
-      if (length <= RECT_AREA_EPSILON) {
+      const length = boundLength(bound);
+      if (length <= RECT_AREA_EPSILON) continue;
+
+      const onThisBound = horizontal
+        ? Math.abs(p.y - bound.y1) <= RECT_AREA_EPSILON && Math.abs(next.y - bound.y2) <= RECT_AREA_EPSILON
+        : Math.abs(p.x - bound.x1) <= RECT_AREA_EPSILON && Math.abs(next.x - bound.x2) <= RECT_AREA_EPSILON;
+      if (!onThisBound) {
+        cursor += length;
         continue;
       }
 
-      if (side === "top" || side === "bottom") {
-        if (Math.abs(p.y - next.y) > RECT_AREA_EPSILON) {
-          cursor += length;
-          continue;
-        }
-        if (Math.abs(p.y - bound.y1) > RECT_AREA_EPSILON || Math.abs(next.y - bound.y2) > RECT_AREA_EPSILON) {
-          cursor += length;
-          continue;
-        }
-        const edgeStart = Math.min(p.x, next.x);
-        const edgeEnd = Math.max(p.x, next.x);
-        const boundStart = Math.min(bound.x1, bound.x2);
-        const boundEnd = Math.max(bound.x1, bound.x2);
-        const overlapStart = Math.max(edgeStart, boundStart);
-        const overlapEnd = Math.min(edgeEnd, boundEnd);
-        if (overlapEnd - overlapStart > RECT_AREA_EPSILON) {
-          return {
-            start: (cursor + (overlapStart - boundStart)) / totalLength,
-            end: (cursor + (overlapEnd - boundStart)) / totalLength,
-          };
-        }
-      } else {
-        if (Math.abs(p.x - next.x) > RECT_AREA_EPSILON) {
-          cursor += length;
-          continue;
-        }
-        if (Math.abs(p.x - bound.x1) > RECT_AREA_EPSILON || Math.abs(next.x - bound.x2) > RECT_AREA_EPSILON) {
-          cursor += length;
-          continue;
-        }
-        const edgeStart = Math.min(p.y, next.y);
-        const edgeEnd = Math.max(p.y, next.y);
-        const boundStart = Math.min(bound.y1, bound.y2);
-        const boundEnd = Math.max(bound.y1, bound.y2);
-        const overlapStart = Math.max(edgeStart, boundStart);
-        const overlapEnd = Math.min(edgeEnd, boundEnd);
-        if (overlapEnd - overlapStart > RECT_AREA_EPSILON) {
-          return {
-            start: (cursor + (overlapStart - boundStart)) / totalLength,
-            end: (cursor + (overlapEnd - boundStart)) / totalLength,
-          };
-        }
+      const edgeStart = horizontal ? Math.min(p.x, next.x) : Math.min(p.y, next.y);
+      const edgeEnd = horizontal ? Math.max(p.x, next.x) : Math.max(p.y, next.y);
+      const boundStart = horizontal ? Math.min(bound.x1, bound.x2) : Math.min(bound.y1, bound.y2);
+      const boundEnd = horizontal ? Math.max(bound.x1, bound.x2) : Math.max(bound.y1, bound.y2);
+      const overlapStart = Math.max(edgeStart, boundStart);
+      const overlapEnd = Math.min(edgeEnd, boundEnd);
+      if (overlapEnd - overlapStart > RECT_AREA_EPSILON) {
+        return {
+          start: (cursor + (overlapStart - boundStart)) / totalLength,
+          end: (cursor + (overlapEnd - boundStart)) / totalLength,
+        };
       }
 
       cursor += length;

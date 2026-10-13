@@ -6,70 +6,19 @@ import {
   rectAreaHasMinimumSize,
   rectAreaSharedEdgeCouple,
 } from "./editor-geometry";
+import { createDebugLogger } from "./debug";
 
-const AREA_GEOMETRY_DEBUG = false;
-const AREA_GEOMETRY_DEBUG_MAX_CHARS = 1400;
-const AREA_GEOMETRY_REPEAT_SUMMARY_EVERY = 50;
-const AREA_GEOMETRY_LABEL_ALLOW = [
-  "coupleSharedBoundarySegment:decision",
-  "coupleSharedBoundarySegment:no-overlap",
-  "coupleSharedBoundarySegment:no-overlap-intervals",
-];
-const areaGeometryLogState = new Map<string, { text: string; count: number }>();
-
-function areaGeometryDebugAllowed(label: string): boolean {
-  return AREA_GEOMETRY_LABEL_ALLOW.some((prefix) => label.startsWith(prefix));
-}
-
-function areaGeometryCompact(value: unknown, depth = 0): unknown {
-  if (value == null) return value;
-  if (typeof value === "bigint") return String(value);
-  if (typeof value !== "object") return value;
-  if (value instanceof Set) return `Set(${value.size})`;
-  if (value instanceof Map) return `Map(${value.size})`;
-  if (Array.isArray(value)) {
-    if (depth >= 2) return `Array(${value.length})`;
-    const sample = value.slice(0, 6).map((item) => areaGeometryCompact(item, depth + 1));
-    if (value.length > 6) sample.push(`...(+${value.length - 6})`);
-    return sample;
-  }
-  const input = value as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const [key, raw] of Object.entries(input)) {
-    if (key === "points" || key === "other" || key === "coupled") {
-      out[key] = Array.isArray(raw) ? `Array(${raw.length})` : "[omitted]";
-      continue;
-    }
-    out[key] = depth >= 2 ? "[nested]" : areaGeometryCompact(raw, depth + 1);
-  }
-  return out;
-}
-
-const serializeDebug = (value: unknown): string => {
-  const compact = areaGeometryCompact(value);
-  const text = JSON.stringify(compact, null, 0);
-  if (!text) return String(compact);
-  if (text.length <= AREA_GEOMETRY_DEBUG_MAX_CHARS) return text;
-  return `${text.slice(0, AREA_GEOMETRY_DEBUG_MAX_CHARS)}... [truncated ${text.length - AREA_GEOMETRY_DEBUG_MAX_CHARS} chars]`;
-};
-const areaGeometryDebug = (label: string, value: unknown): void => {
-  if (!AREA_GEOMETRY_DEBUG) return;
-  if (!areaGeometryDebugAllowed(label)) return;
-  const text = serializeDebug(value);
-  const prev = areaGeometryLogState.get(label);
-  if (prev && prev.text === text) {
-    prev.count += 1;
-    if (prev.count % AREA_GEOMETRY_REPEAT_SUMMARY_EVERY === 0) {
-      console.log(`[easy-floorplan:geometry] ${label} (same payload repeated ${prev.count}x)`);
-    }
-    return;
-  }
-  if (prev && prev.count > 1) {
-    console.log(`[easy-floorplan:geometry] ${label} (same payload repeated ${prev.count}x)`);
-  }
-  areaGeometryLogState.set(label, { text, count: 1 });
-  console.log(`[easy-floorplan:geometry] ${label}`, text);
-};
+const areaGeometryDebug = createDebugLogger("geometry", {
+  enabled: false,
+  maxChars: 1400,
+  repeatSummaryEvery: 50,
+  labelAllow: [
+    "coupleSharedBoundarySegment:decision",
+    "coupleSharedBoundarySegment:no-overlap",
+    "coupleSharedBoundarySegment:no-overlap-intervals",
+  ],
+  arrayLengthKeys: ["points", "other", "coupled"],
+});
 
 export function rectAreasOverlap(a: Area, b: Area): boolean {
   const aXs = a.points.map((p) => p.x);
@@ -149,6 +98,40 @@ export function rectAreasOverlap(a: Area, b: Area): boolean {
   return false;
 }
 
+/**
+ * Which vertices of `points` are a "stale" duplicate: part of a run of
+ * coincident vertices (the editor inserts these at a boundary split point)
+ * but not the first one. A stale duplicate is skipped when a boundary move
+ * is applied so only one copy of the coincident point actually travels,
+ * instead of every copy independently recomputing the same new position.
+ * Shared by `moveAreaBoundary` and `coupleSharedBoundarySegment`.
+ */
+function staleDuplicateVertices(points: readonly AreaPoint[]): boolean[] {
+  const len = points.length;
+  const samePoint = (a: AreaPoint, b: AreaPoint): boolean =>
+    Math.abs(a.x - b.x) <= RECT_AREA_EPSILON && Math.abs(a.y - b.y) <= RECT_AREA_EPSILON;
+  const runStart = (index: number): number => {
+    let start = index;
+    while (samePoint(points[(start - 1 + len) % len]!, points[start]!)) {
+      start = (start - 1 + len) % len;
+    }
+    return start;
+  };
+  const runEnd = (index: number): number => {
+    let end = index;
+    while (samePoint(points[end]!, points[(end + 1) % len]!)) {
+      end = (end + 1) % len;
+    }
+    return end;
+  };
+  return points.map((_, index) => {
+    const start = runStart(index);
+    const end = runEnd(index);
+    if (start === end) return false;
+    return index === start;
+  });
+}
+
 export function moveAreaBoundary(
   points: readonly AreaPoint[],
   delta: { dx: number; dy: number },
@@ -169,42 +152,22 @@ export function moveAreaBoundary(
       ? (movingSide === "right" ? bounds.maxX : bounds.minX)
       : (movingSide === "bottom" ? bounds.maxY : bounds.minY)
   );
-  const samePoint = (a: AreaPoint, b: AreaPoint): boolean =>
-    Math.abs(a.x - b.x) <= RECT_AREA_EPSILON &&
-    Math.abs(a.y - b.y) <= RECT_AREA_EPSILON;
-  const duplicateRun = (index: number): { start: number; end: number } | undefined => {
-    const len = points.length;
-    let start = index;
-    while (samePoint(points[(start - 1 + len) % len], points[start])) {
-      start = (start - 1 + len) % len;
-    }
-    let end = index;
-    while (samePoint(points[end], points[(end + 1) % len])) {
-      end = (end + 1) % len;
-    }
-    if (start === end) return undefined;
-    return { start, end };
-  };
-  const staleDuplicate = (index: number): boolean => {
-    const run = duplicateRun(index);
-    if (!run) return false;
-    return index === run.start;
-  };
+  const stale = staleDuplicateVertices(points);
 
   const next = points.map((point, index) => {
     if (isVertical) {
       if (Math.abs(point.x - boundary) > RECT_AREA_EPSILON) return { ...point };
-      if (staleDuplicate(index)) return { ...point };
+      if (stale[index]) return { ...point };
       return { ...point, x: boundary + delta.dx };
     }
     if (Math.abs(point.y - boundary) > RECT_AREA_EPSILON) return { ...point };
-    if (staleDuplicate(index)) return { ...point };
+    if (stale[index]) return { ...point };
     return { ...point, y: boundary + delta.dy };
   });
   areaGeometryDebug("moveAreaBoundary:results", {
     boundary,
     delta,
-    staleByIndex: points.map((_, index) => ({ index, stale: staleDuplicate(index) })),
+    staleByIndex: points.map((_, index) => ({ index, stale: stale[index] })),
     next,
   });
   return next;
@@ -234,12 +197,6 @@ export function coupleSharedBoundarySegment(
       ? (movingSide === "right" ? bounds.maxX : bounds.minX)
       : (movingSide === "bottom" ? bounds.maxY : bounds.minY)
   );
-  const otherBoundary = primaryBoundary;
-  // The neighbour's shared edge is expected to sit at exactly `primaryBoundary`
-  // (areas only couple across an exact, pre-move shared wall) — no epsilon
-  // search for a near-but-not-exact coordinate. `boundaryIntervals` below
-  // simply returns no intervals when that doesn't hold, so a near-miss
-  // silently couples nothing rather than erroring.
   const boundaryIntervals = (
     poly: readonly AreaPoint[],
     boundary: number
@@ -264,11 +221,10 @@ export function coupleSharedBoundarySegment(
   };
 
   const primaryIntervals = boundaryIntervals(points, primaryBoundary);
-  const otherIntervals = boundaryIntervals(other, otherBoundary);
+  const otherIntervals = boundaryIntervals(other, primaryBoundary);
   if (!primaryIntervals.length || !otherIntervals.length) {
     areaGeometryDebug("coupleSharedBoundarySegment:no-overlap", {
       primaryBoundary,
-      otherBoundary,
       primaryIntervals,
       otherIntervals,
     });
@@ -296,35 +252,15 @@ export function coupleSharedBoundarySegment(
 
   const coupled = other.map((point) => ({ ...point }));
   const moveVertex = new Array<boolean>(other.length).fill(false);
-  const samePoint = (a: AreaPoint, b: AreaPoint): boolean =>
-    Math.abs(a.x - b.x) <= RECT_AREA_EPSILON &&
-    Math.abs(a.y - b.y) <= RECT_AREA_EPSILON;
-  const duplicateRun = (index: number): { start: number; end: number } | undefined => {
-    const len = other.length;
-    let start = index;
-    while (samePoint(other[(start - 1 + len) % len], other[start])) {
-      start = (start - 1 + len) % len;
-    }
-    let end = index;
-    while (samePoint(other[end], other[(end + 1) % len])) {
-      end = (end + 1) % len;
-    }
-    if (start === end) return undefined;
-    return { start, end };
-  };
-  const isStaleDuplicateVertex = (index: number): boolean => {
-    const run = duplicateRun(index);
-    if (!run) return false;
-    return index === run.start;
-  };
+  const staleOther = staleDuplicateVertices(other);
 
   for (let i = 0; i < other.length; i++) {
     const j = (i + 1) % other.length;
     const a = other[i]!;
     const b = other[j]!;
     const edgeOnBoundary = isVertical
-      ? Math.abs(a.x - otherBoundary) <= RECT_AREA_EPSILON && Math.abs(b.x - otherBoundary) <= RECT_AREA_EPSILON
-      : Math.abs(a.y - otherBoundary) <= RECT_AREA_EPSILON && Math.abs(b.y - otherBoundary) <= RECT_AREA_EPSILON;
+      ? Math.abs(a.x - primaryBoundary) <= RECT_AREA_EPSILON && Math.abs(b.x - primaryBoundary) <= RECT_AREA_EPSILON
+      : Math.abs(a.y - primaryBoundary) <= RECT_AREA_EPSILON && Math.abs(b.y - primaryBoundary) <= RECT_AREA_EPSILON;
     if (!edgeOnBoundary) continue;
 
     const edgeIsDegenerate =
@@ -341,10 +277,8 @@ export function coupleSharedBoundarySegment(
     });
     if (!overlaps) continue;
 
-    const staleI = isStaleDuplicateVertex(i);
-    const staleJ = isStaleDuplicateVertex(j);
-    moveVertex[i] = !staleI;
-    moveVertex[j] = !staleJ;
+    moveVertex[i] = !staleOther[i];
+    moveVertex[j] = !staleOther[j];
   }
 
   let moved = false;
@@ -360,12 +294,11 @@ export function coupleSharedBoundarySegment(
 
   areaGeometryDebug("coupleSharedBoundarySegment:decision", {
     primaryBoundary,
-    otherBoundary,
     overlapIntervals,
     moveVertex,
     staleByIndex: other.map((_, index) => ({
       index,
-      stale: isStaleDuplicateVertex(index),
+      stale: staleOther[index],
       point: other[index],
     })),
     coupled,

@@ -105,6 +105,30 @@ describe("moveAreaBoundary", () => {
     const points = [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 10 }, { x: 0, y: 10 }];
     expect(moveAreaBoundary(points, { dx: 5, dy: 0 })).toBeUndefined();
   });
+
+  it("moves only the later copy of a coincident vertex pair, leaving the earlier one in place", () => {
+    // The editor inserts a duplicate vertex at a boundary split point. Only
+    // one copy should travel with the moved boundary — the earlier one (by
+    // backward scan) stays put so an adjacent, unrelated run of the same
+    // boundary keeps its own position.
+    const points = [
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 10 },
+      { x: 0, y: 10 },
+    ];
+    const moved = moveAreaBoundary(points, { dx: 0, dy: 5 }, "top", 0);
+    expect(moved).toEqual([
+      { x: 0, y: 5 },
+      { x: 10, y: 0 },
+      { x: 10, y: 5 },
+      { x: 20, y: 5 },
+      { x: 20, y: 10 },
+      { x: 0, y: 10 },
+    ]);
+  });
 });
 
 describe("coupleSharedBoundarySegment", () => {

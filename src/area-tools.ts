@@ -19,69 +19,15 @@ import {
 import { coupleSharedBoundarySegment } from "./area-push-tools";
 import { signedArea, traceFaces } from "./dead-space";
 import { pointInPolygon } from "./render";
+import { createDebugLogger } from "./debug";
 
-const AREA_TOOLS_DEBUG = false;
-const AREA_TOOLS_DEBUG_MAX_CHARS = 1200;
-const AREA_TOOLS_REPEAT_SUMMARY_EVERY = 20;
-const AREA_TOOLS_LABEL_ALLOW = [
-  "toggleRectAreaSide:",
-  "clickRectAreaSide:",
-];
-const areaToolsLogState = new Map<string, { text: string; count: number }>();
-
-function areaToolsDebugAllowed(label: string): boolean {
-  return AREA_TOOLS_LABEL_ALLOW.some((prefix) => label.startsWith(prefix));
-}
-
-function areaToolsCompact(value: unknown, depth = 0): unknown {
-  if (value == null) return value;
-  if (typeof value === "bigint") return String(value);
-  if (typeof value !== "object") return value;
-  if (value instanceof Set) return `Set(${value.size})`;
-  if (value instanceof Map) return `Map(${value.size})`;
-  if (Array.isArray(value)) {
-    if (depth >= 2) return `Array(${value.length})`;
-    const sample = value.slice(0, 6).map((item) => areaToolsCompact(item, depth + 1));
-    if (value.length > 6) sample.push(`...(+${value.length - 6})`);
-    return sample;
-  }
-  const input = value as Record<string, unknown>;
-  const out: Record<string, unknown> = {};
-  for (const [key, raw] of Object.entries(input)) {
-    if (key === "area" || key === "updated" || key === "sideWalls") {
-      out[key] = "[omitted]";
-      continue;
-    }
-    out[key] = depth >= 2 ? "[nested]" : areaToolsCompact(raw, depth + 1);
-  }
-  return out;
-}
-
-const serializeDebug = (value: unknown): string => {
-  const compact = areaToolsCompact(value);
-  const text = JSON.stringify(compact, null, 0);
-  if (!text) return String(compact);
-  if (text.length <= AREA_TOOLS_DEBUG_MAX_CHARS) return text;
-  return `${text.slice(0, AREA_TOOLS_DEBUG_MAX_CHARS)}... [truncated ${text.length - AREA_TOOLS_DEBUG_MAX_CHARS} chars]`;
-};
-const areaToolsDebug = (label: string, value: unknown): void => {
-  if (!AREA_TOOLS_DEBUG) return;
-  if (!areaToolsDebugAllowed(label)) return;
-  const text = serializeDebug(value);
-  const prev = areaToolsLogState.get(label);
-  if (prev && prev.text === text) {
-    prev.count += 1;
-    if (prev.count % AREA_TOOLS_REPEAT_SUMMARY_EVERY === 0) {
-      console.log(`[easy-floorplan:area-tools] ${label} (same payload repeated ${prev.count}x)`);
-    }
-    return;
-  }
-  if (prev && prev.count > 1) {
-    console.log(`[easy-floorplan:area-tools] ${label} (same payload repeated ${prev.count}x)`);
-  }
-  areaToolsLogState.set(label, { text, count: 1 });
-  console.log(`[easy-floorplan:area-tools] ${label}`, text);
-};
+const areaToolsDebug = createDebugLogger("area-tools", {
+  enabled: false,
+  maxChars: 1200,
+  repeatSummaryEvery: 20,
+  labelAllow: ["toggleRectAreaSide:", "clickRectAreaSide:"],
+  omitKeys: ["area", "updated", "sideWalls"],
+});
 
 export function updateAreaRectangleDraft(
   start: AreaPoint,
@@ -325,9 +271,7 @@ export function toggleRectAreaSide(
     return updated;
   }
 
-  const state = Array.isArray(current)
-    ? (current.length ? current[0]!.state : "none")
-    : (current ?? "none");
+  const state = current ?? "none";
   const next = rectAreaSideWallNext(state);
   const sideWalls = { ...(a.sideWalls ?? {}) };
   if (next === "none") delete sideWalls[side];
@@ -344,6 +288,34 @@ export function toggleRectAreaSide(
   return updated;
 }
 
+/**
+ * Keep a newly split-off window from overlapping any *other* existing
+ * segment on this side — clicking in the open gap next to an existing wall
+ * must create a new segment that stops at it, not one that reaches past it
+ * and gets merged into (or torn into) that wall by normalization. `exclude`
+ * is the segment the click actually landed inside, if any — that one is
+ * allowed to be touched/absorbed; every other segment is off limits.
+ */
+function clampSegmentWindow(
+  clickT: number,
+  window: { start: number; end: number },
+  segments: readonly RectAreaSideWallSegment[],
+  exclude?: RectAreaSideWallSegment
+): { start: number; end: number } {
+  let start = window.start;
+  let end = window.end;
+  for (const segment of segments) {
+    if (segment === exclude) continue;
+    if (segment.end <= clickT + RECT_AREA_EPSILON) start = Math.max(start, segment.end);
+    if (segment.start >= clickT - RECT_AREA_EPSILON) end = Math.min(end, segment.start);
+  }
+  if (end - start <= RECT_AREA_EPSILON) {
+    const point = Math.min(Math.max(clickT, start), end);
+    return { start: point, end: point };
+  }
+  return { start, end };
+}
+
 export function splitRectAreaSide(
   a: Area,
   edgeIndex: number,
@@ -354,10 +326,9 @@ export function splitRectAreaSide(
   const side = rectAreaEdgeSide(a, edgeIndex);
   const sideWalls = { ...(a.sideWalls ?? {}) };
   const prev = sideWalls[side] as RectAreaSideWallValue | undefined;
-  const window = segmentWindowAt(clickT);
+  const segmentWindow = segmentWindowAt(clickT);
 
   if (typeof prev === "string" && prev !== "none") {
-    const segmentWindow = window;
     sideWalls[side] = [{ start: segmentWindow.start, end: segmentWindow.end, state: prev }];
     return { ...a, sideWalls };
   }
@@ -374,8 +345,8 @@ export function splitRectAreaSide(
       (segment) => clickT > segment.start + RECT_AREA_EPSILON && clickT < segment.end - RECT_AREA_EPSILON
     );
     const state = existing?.state ?? "wall";
-    const segmentWindow = window;
-    segments.push({ start: segmentWindow.start, end: segmentWindow.end, state });
+    const clamped = clampSegmentWindow(clickT, segmentWindow, segments, existing);
+    segments.push({ start: clamped.start, end: clamped.end, state });
   }
 
   return applySideWallSegments(a, side, segments).updated;

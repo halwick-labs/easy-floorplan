@@ -133,6 +133,52 @@ function boundaryValue(points: Array<{ x: number; y: number }>, side: "left" | "
   return Math.max(...points.map((p) => p.y));
 }
 
+/**
+ * Point-by-point `toBeCloseTo`, for geometry that round-tripped through
+ * several real pointer gestures (each resolving coordinates through a live
+ * `getScreenCTM()`) and so can carry a few ULP of float noise even when it
+ * is, numerically, back where it started.
+ */
+function expectPointsClose(
+  actual: Array<{ x: number; y: number }>,
+  expected: Array<{ x: number; y: number }>,
+  precision = 6
+): void {
+  expect(actual.length).toBe(expected.length);
+  actual.forEach((p, i) => {
+    expect(p.x).toBeCloseTo(expected[i]!.x, precision);
+    expect(p.y).toBeCloseTo(expected[i]!.y, precision);
+  });
+}
+
+/**
+ * Position of the shared-wall vertex nearest `near` in `before`, read back out
+ * of `after` (same index, same order — neither drag path inserts or removes
+ * vertices). Unlike {@link boundaryValue}'s whole-polygon bbox min/max, this
+ * stays correct for an L-shaped "other" whose own notch can sit further out
+ * on the same axis than the actual shared wall (issue: the bbox version
+ * picked up the notch instead of the dragged edge and reported a stale
+ * boundary).
+ */
+function sharedBoundaryValue(
+  before: Array<{ x: number; y: number }>,
+  after: Array<{ x: number; y: number }>,
+  side: "left" | "right" | "top" | "bottom",
+  near: { x: number; y: number }
+): number {
+  let bestIndex = 0;
+  let bestDist = Infinity;
+  before.forEach((p, i) => {
+    const d = Math.hypot(p.x - near.x, p.y - near.y);
+    if (d < bestDist) {
+      bestDist = d;
+      bestIndex = i;
+    }
+  });
+  const moved = after[bestIndex]!;
+  return side === "left" || side === "right" ? moved.x : moved.y;
+}
+
 function findAreaEdge(
   ed: FloorplanCardEditor,
   areaId: string,
@@ -419,8 +465,11 @@ async function expectConcavePerimeterToggleMatrix(
   ]);
 }
 
-async function expectModifierSegmentLocality(shapeName: string, points: Array<{ x: number; y: number }>): Promise<void> {
-  const edgeIndex = 0;
+async function expectModifierSegmentLocality(
+  shapeName: string,
+  points: Array<{ x: number; y: number }>,
+  edgeIndex = 0
+): Promise<void> {
   const expected = edgeIntervalFor(points, edgeIndex, shapeName);
   const expectedLength = expected.end - expected.start;
   const edgeCoverage = (segments: Array<{ start: number; end: number; state: "wall" | "divider" }>): number =>
@@ -1823,6 +1872,89 @@ describe("editor drag", () => {
       { x: 100, y: 300 },
     ];
     await expectModifierSegmentLocality("U-shape", points);
+  });
+
+  // Edges 0/1 of these shapes happen to wind in the same direction as the
+  // ascending-coordinate order `_edgeIntervalOnSideBoundary` parameterizes
+  // sides in. Edges 2/3 (a clockwise rectangle's bottom and left) and the
+  // L-shape's bottom wind the *other* way — a regression here mapped a click
+  // to its mirror image across the edge's midpoint instead of where the
+  // pointer actually was (reported: a ctrl-click's new segment landed on the
+  // wrong side of the edge).
+  it("Rectangle ctrl-click on the bottom edge (reversed winding) lands on the clicked side, not mirrored", async () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 240 },
+      { x: 100, y: 240 },
+    ];
+    await expectModifierSegmentLocality("Rectangle", points, 2);
+  });
+
+  it("Rectangle ctrl-click on the left edge (reversed winding) lands on the clicked side, not mirrored", async () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 240 },
+      { x: 100, y: 240 },
+    ];
+    await expectModifierSegmentLocality("Rectangle", points, 3);
+  });
+
+  it("L-shape ctrl-click on the left edge (reversed winding) lands on the clicked side, not mirrored", async () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 200 },
+      { x: 200, y: 200 },
+      { x: 200, y: 300 },
+      { x: 100, y: 300 },
+    ];
+    await expectModifierSegmentLocality("L-shape", points, 5);
+  });
+
+  it("ctrl-click next to an existing wall segment creates a separate segment instead of joining or overlapping it", async () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 240 },
+      { x: 100, y: 240 },
+    ];
+    const ed = await mountAreaEditor(points, { top: [{ start: 0.5, end: 0.7, state: "wall" }] });
+
+    const hit = ed.shadowRoot!.querySelector<SVGLineElement>(
+      '.area-edge-hit[data-area-id="room1"][data-edge-index="0"]'
+    );
+    expect(hit).toBeTruthy();
+    const box = hit!.getBoundingClientRect();
+    // 0.75 along the top edge: just past the existing segment's end (0.7).
+    // The default split window is 0.3 wide, so an unclamped window centered
+    // here (0.6 to 0.9) would reach back into the existing segment.
+    const clickX = box.left + box.width * 0.75;
+    const clickY = box.top + box.height * 0.5;
+
+    hit!.dispatchEvent(
+      new MouseEvent("click", {
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+        ctrlKey: true,
+        clientX: clickX,
+        clientY: clickY,
+      })
+    );
+    await ed.updateComplete;
+
+    const area = (ed as any)._floor().areas.find((a: any) => a.id === "room1");
+    const segments = rectAreaSideWallSegments(area.sideWalls?.top);
+    expect(segments).toHaveLength(2);
+    const [first, second] = segments;
+    expect(first!.start).toBeCloseTo(0.5, 2);
+    expect(first!.end).toBeCloseTo(0.7, 2);
+    expect(second!.start).toBeGreaterThanOrEqual(first!.end - RECT_AREA_EPSILON);
+    expect(second!.end).toBeGreaterThan(second!.start);
+
+    document.body.innerHTML = "";
   });
 
   it("L/U/rectangle shared layout keeps all L edges smooth for incremental pushes", async () => {
@@ -5017,7 +5149,7 @@ describe("editor drag", () => {
       expectFloorplanRectilinear((ed as any)._floor().areas);
       expectPolygonGeometry(primary.points);
       expectPolygonGeometry(other.points);
-      expect(primary.points).toEqual([
+      expectPointsClose(primary.points, [
         { x: 380, y: 300 },
         { x: 540, y: 300 },
         { x: 540, y: 300 },
@@ -5432,14 +5564,14 @@ describe("editor drag", () => {
             expectAxisAligned(selAfter);
             expectAxisAligned(otherAfter);
 
-            const selBeforeBoundary = boundaryValue(selBefore, side);
-            const selAfterBoundary = boundaryValue(selAfter, side);
+            const selBeforeBoundary = sharedBoundaryValue(selBefore, selBefore, side, midWorld);
+            const selAfterBoundary = sharedBoundaryValue(selBefore, selAfter, side, midWorld);
             const movedAmount = Math.abs(selAfterBoundary - selBeforeBoundary);
             expect(movedAmount).toBeGreaterThan(0.25);
 
             const otherOpp = oppositeSide(side);
-            const otherBeforeBoundary = boundaryValue(otherBefore, otherOpp);
-            const otherAfterBoundary = boundaryValue(otherAfter, otherOpp);
+            const otherBeforeBoundary = sharedBoundaryValue(otherBefore, otherBefore, otherOpp, midWorld);
+            const otherAfterBoundary = sharedBoundaryValue(otherBefore, otherAfter, otherOpp, midWorld);
             const otherMoved = Math.abs(otherAfterBoundary - otherBeforeBoundary);
             expect(otherMoved).toBeGreaterThan(0.25);
 

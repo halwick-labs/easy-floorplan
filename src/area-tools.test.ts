@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { rectAreaUnionPoints, toggleRectAreaSide } from "./area-tools";
-import { rectAreaSideWallSegments } from "./editor-geometry";
+import { rectAreaUnionPoints, splitRectAreaSide, toggleRectAreaSide } from "./area-tools";
+import { rectAreaSideWallSegments, RECT_AREA_EPSILON } from "./editor-geometry";
 import { signedArea } from "./dead-space";
 import type { Area } from "./types";
 
@@ -107,6 +107,104 @@ describe("toggleRectAreaSide without a target interval", () => {
     const none = toggleRectAreaSide(divider!, 2, 0.5);
     expect(none).toBeDefined();
     expect(none!.sideWalls?.bottom).toBeUndefined();
+  });
+});
+
+describe("splitRectAreaSide places the new segment at the clicked point", () => {
+  it("creates a segment containing the clicked point on a side with no existing wall", () => {
+    const base = rectangleArea();
+
+    const updated = splitRectAreaSide(base, 0, 0.2);
+    expect(updated).toBeDefined();
+    const segments = rectAreaSideWallSegments(updated!.sideWalls?.top);
+    expect(segments).toHaveLength(1);
+    expect(segments[0]!.start).toBeLessThanOrEqual(0.2);
+    expect(segments[0]!.end).toBeGreaterThanOrEqual(0.2);
+  });
+
+  it("creates a segment containing the clicked point near the end of the edge, not mirrored to the other end", () => {
+    const base = rectangleArea();
+
+    // A click near t=0.9 must produce a segment around t=0.9 — not one
+    // mirrored across the midpoint to sit around t=0.1 (issue: a reversed
+    // click-fraction bug did exactly that on some edges).
+    const updated = splitRectAreaSide(base, 0, 0.9);
+    const segments = rectAreaSideWallSegments(updated!.sideWalls?.top);
+    expect(segments).toHaveLength(1);
+    expect(segments[0]!.start).toBeGreaterThan(0.5);
+    expect(segments[0]!.end).toBeGreaterThan(0.5);
+    expect(segments[0]!.start).toBeLessThanOrEqual(0.9);
+    expect(segments[0]!.end).toBeGreaterThanOrEqual(0.9);
+  });
+
+  it("extends the clicked segment in place when the click lands inside an existing one", () => {
+    const base = rectangleArea();
+    base.sideWalls = { top: [{ start: 0.5, end: 0.7, state: "wall" }] };
+
+    const updated = splitRectAreaSide(base, 0, 0.6);
+    const segments = rectAreaSideWallSegments(updated!.sideWalls?.top);
+    // Same state, overlapping window: normalizes back down to one segment
+    // that still covers the clicked point, rather than a second one on top
+    // of the first.
+    expect(segments).toHaveLength(1);
+    expect(segments[0]!.state).toBe("wall");
+    expect(segments[0]!.start).toBeLessThanOrEqual(0.6);
+    expect(segments[0]!.end).toBeGreaterThanOrEqual(0.6);
+  });
+
+  it("does not overlap or merge with an existing wall segment when clicking in the gap after it", () => {
+    const base = rectangleArea();
+    base.sideWalls = { top: [{ start: 0.5, end: 0.7, state: "wall" }] };
+
+    // Default split span is 0.3, so an unclamped window centered on 0.75
+    // would run from 0.6 to 0.9 — reaching back into the existing segment.
+    const updated = splitRectAreaSide(base, 0, 0.75);
+    const segments = rectAreaSideWallSegments(updated!.sideWalls?.top);
+    expect(segments).toHaveLength(2);
+    const [first, second] = segments;
+    expect(first!.start).toBeCloseTo(0.5, 6);
+    expect(first!.end).toBeCloseTo(0.7, 6);
+    // The new segment must start at or after the existing one's end — never
+    // inside it.
+    expect(second!.start).toBeGreaterThanOrEqual(first!.end - RECT_AREA_EPSILON);
+    expect(second!.end).toBeGreaterThanOrEqual(0.75);
+  });
+
+  it("does not overlap or merge with an existing divider segment when clicking in the gap before it", () => {
+    const base = rectangleArea();
+    base.sideWalls = { top: [{ start: 0.5, end: 0.7, state: "divider" }] };
+
+    // Default span centered on 0.45 would run 0.3 to 0.6 — reaching into the
+    // divider segment that follows.
+    const updated = splitRectAreaSide(base, 0, 0.45);
+    const segments = rectAreaSideWallSegments(updated!.sideWalls?.top);
+    expect(segments).toHaveLength(2);
+    const [first, second] = segments;
+    expect(first!.state).toBe("wall");
+    expect(first!.start).toBeLessThanOrEqual(0.45);
+    expect(first!.end).toBeLessThanOrEqual(0.5);
+    expect(second!.state).toBe("divider");
+    expect(second!.start).toBeCloseTo(0.5, 6);
+    expect(second!.end).toBeCloseTo(0.7, 6);
+  });
+
+  it("collapses to a sliver rather than overlapping either neighbor when clicking in a narrow gap", () => {
+    const base = rectangleArea();
+    base.sideWalls = {
+      top: [
+        { start: 0.4, end: 0.5, state: "wall" },
+        { start: 0.55, end: 0.65, state: "divider" },
+      ],
+    };
+
+    const updated = splitRectAreaSide(base, 0, 0.52);
+    const segments = rectAreaSideWallSegments(updated!.sideWalls?.top);
+    // The gap between the two neighbors (0.5 to 0.55) is narrower than the
+    // default split span: the new segment must still not overlap either one.
+    const newSegment = segments.find((segment) => segment.start >= 0.5 - RECT_AREA_EPSILON && segment.end <= 0.55 + RECT_AREA_EPSILON);
+    expect(newSegment).toBeDefined();
+    expect(newSegment!.start).toBeGreaterThanOrEqual(0.5 - RECT_AREA_EPSILON);
+    expect(newSegment!.end).toBeLessThanOrEqual(0.55 + RECT_AREA_EPSILON);
   });
 });
 
