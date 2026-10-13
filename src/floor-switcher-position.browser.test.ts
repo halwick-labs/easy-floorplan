@@ -347,16 +347,15 @@ async function mountEditor(extra: Partial<FloorplanCardConfig> = {}) {
   };
 }
 
-/** The coordinate fields sit behind the Project section and its own group. */
+/** The coordinate fields live in the Project tab and Floor switcher group. */
 async function openSwitcherPanel(ed: FloorplanCardEditor): Promise<HTMLInputElement[]> {
   const root = ed.shadowRoot!;
-  root.querySelector<HTMLButtonElement>("button.section-toggle")?.click();
+  root.querySelector<HTMLButtonElement>("#project-tab")?.click();
   await ed.updateComplete;
-  [...root.querySelectorAll<HTMLButtonElement>(".cfg-group-title")]
-    .find((b) => b.textContent?.includes("Floor switcher"))
-    ?.click();
+  root.querySelector<HTMLButtonElement>('#project-category-plan')!.click();
   await ed.updateComplete;
-  return [...root.querySelectorAll<HTMLInputElement>("input[type=number]")];
+  const group = root.querySelector<HTMLElement>('[data-group="Floor switcher"]')!;
+  return [...group.querySelectorAll<HTMLInputElement>("input[type=number]")];
 }
 
 /** Type into a field and commit it, the way a keyboard user would. */
@@ -365,6 +364,78 @@ async function typeInto(ed: FloorplanCardEditor, field: HTMLInputElement, value:
   field.dispatchEvent(new Event("change", { bubbles: true }));
   await ed.updateComplete;
 }
+
+describe("switcher appearance survives editing its position", () => {
+  afterEach(() => { document.body.innerHTML = ""; });
+  const appearance = { style: "buttons", layout: "horizontal" } as const;
+
+  it("edits style and layout, previews them, and saves them without needing a position", async () => {
+    const t = await mountEditor();
+    await openSwitcherPanel(t.ed);
+    for (const [id, value] of [["style", "buttons"], ["layout", "horizontal"]]) {
+      const select = t.ed.shadowRoot!.querySelector<HTMLSelectElement>(`#floor-switcher-${id}`)!;
+      select.value = value;
+      select.dispatchEvent(new Event("change", { bubbles: true }));
+      await t.ed.updateComplete;
+    }
+    expect(t.emitted[t.emitted.length - 1]?.floorSwitcher).toEqual(appearance);
+    expect(getComputedStyle(t.handle()).flexDirection).toBe("row");
+    expect(getComputedStyle(t.handle()).gap).toBe("8px");
+    expect(t.handle().querySelector(".sh-btn")!.getBoundingClientRect().height).toBeGreaterThanOrEqual(44);
+    // Reload what the host saved, rather than relying on the current form state.
+    const reloaded = await mountEditor(JSON.parse(JSON.stringify(t.emitted[t.emitted.length - 1])));
+    await openSwitcherPanel(reloaded.ed);
+    expect(reloaded.ed.shadowRoot!.querySelector<HTMLSelectElement>("#floor-switcher-style")!.value).toBe("buttons");
+    expect(reloaded.ed.shadowRoot!.querySelector<HTMLSelectElement>("#floor-switcher-layout")!.value).toBe("horizontal");
+  });
+
+  it("preserves appearance on a drag and undo", async () => {
+    const t = await mountEditor({ floorSwitcher: appearance });
+    await t.dragTo(100, 120);
+    expect(t.emitted[t.emitted.length - 1]?.floorSwitcher).toEqual({ ...appearance, x: 100, y: 120 });
+    (t.ed as unknown as { _undo(): void })._undo();
+    await t.ed.updateComplete;
+    expect(t.emitted[t.emitted.length - 1]?.floorSwitcher).toEqual(appearance);
+  });
+
+  it("preserves appearance when typing or clearing a coordinate", async () => {
+    const t = await mountEditor({ floorSwitcher: { ...appearance, x: 60, y: 100 } });
+    const [x, y] = await openSwitcherPanel(t.ed);
+    await typeInto(t.ed, y, "40");
+    expect(t.emitted[t.emitted.length - 1]?.floorSwitcher).toEqual({ ...appearance, x: 60, y: 40 });
+    await typeInto(t.ed, x, "");
+    expect(t.emitted[t.emitted.length - 1]?.floorSwitcher).toEqual(appearance);
+  });
+
+  it("replaces a hand-written non-object value rather than spreading it", async () => {
+    const t = await mountEditor({ floorSwitcher: "top-right" as unknown as FloorplanCardConfig["floorSwitcher"] });
+    await openSwitcherPanel(t.ed);
+    const select = t.ed.shadowRoot!.querySelector<HTMLSelectElement>("#floor-switcher-style")!;
+    select.value = "buttons";
+    select.dispatchEvent(new Event("change", { bubbles: true }));
+    await t.ed.updateComplete;
+    expect(t.emitted[t.emitted.length - 1]?.floorSwitcher).toEqual({ style: "buttons" });
+  });
+
+  it("offers no appearance controls for a plan with one floor", async () => {
+    const t = await mountEditor();
+    const cfg = config();
+    t.ed.setConfig({ ...cfg, floors: cfg.floors!.slice(0, 1) });
+    await t.ed.updateComplete;
+    await openSwitcherPanel(t.ed);
+    expect(t.ed.shadowRoot!.querySelector("#floor-switcher-style")).toBeNull();
+    expect(t.ed.shadowRoot!.querySelector("#floor-switcher-layout")).toBeNull();
+  });
+
+  it("preserves appearance when returning to the corner", async () => {
+    const t = await mountEditor({ floorSwitcher: { ...appearance, x: 60, y: 100 } });
+    await openSwitcherPanel(t.ed);
+    [...t.ed.shadowRoot!.querySelectorAll<HTMLButtonElement>("button")]
+      .find(b => b.textContent?.trim() === "Back to the corner")!.click();
+    await t.ed.updateComplete;
+    expect(t.emitted[t.emitted.length - 1]?.floorSwitcher).toEqual(appearance);
+  });
+});
 
 describe("the coordinate fields are a real way to place it", () => {
   afterEach(() => {
@@ -840,13 +911,8 @@ describe("the editor lets you drag the switcher anywhere on the canvas", () => {
     // and a partial position was committed on release.
     const t = await mountEditor();
     const root = t.ed.shadowRoot!;
-    root.querySelector<HTMLButtonElement>("button.section-toggle")?.click();
-    await t.ed.updateComplete;
-    [...root.querySelectorAll<HTMLButtonElement>(".cfg-group-title")]
-      .find((b) => b.textContent?.includes("Floor switcher"))
-      ?.click();
-    await t.ed.updateComplete;
-    const field = root.querySelector("input[type=number]") as HTMLInputElement | null;
+    await openSwitcherPanel(t.ed);
+    const field = root.querySelector('input[aria-label="Floor switcher X, in canvas units"]') as HTMLInputElement | null;
     expect(field, "a coordinate field to focus").toBeTruthy();
     field!.focus();
     const at = t.handleCentre();
@@ -874,15 +940,9 @@ describe("the editor lets you drag the switcher anywhere on the canvas", () => {
     // The visible labels are siblings, so they name nothing: unlabelled, these
     // are two spinbuttons with no way to tell which axis each edits.
     const t = await mountEditor({ floorSwitcher: { x: 60, y: 100 } });
-    // The fields sit behind two collapses — the Project section, then the
-    // "Floor switcher" group inside it — and neither is open on mount.
+    // The fields live in the Project tab and Floor switcher group.
     const root = t.ed.shadowRoot!;
-    root.querySelector<HTMLButtonElement>("button.section-toggle")?.click();
-    await t.ed.updateComplete;
-    [...root.querySelectorAll<HTMLButtonElement>(".cfg-group-title")]
-      .find((b) => b.textContent?.includes("Floor switcher"))
-      ?.click();
-    await t.ed.updateComplete;
+    await openSwitcherPanel(t.ed);
 
     const names = [...root.querySelectorAll("input[type=number]")]
       .map((i) => i.getAttribute("aria-label"))

@@ -317,6 +317,87 @@ open to the air. It still takes doors and windows the way a wall does — a gate
 railing is a door — and an explicit **Thickness** is scaled down with it, so a railing
 stays thinner than the walls beside it.
 
+## Floor button appearance
+
+Choose **Project → Floor switcher → Style → Dashboard buttons** for larger floor
+buttons that use Home Assistant's theme colours and card radius. **Layout** chooses a
+horizontal row or vertical column independently of the compact header. Automatic keeps
+the existing behaviour: a column normally, a row with `compactHeader: true`.
+
+![The same floorplan with classic floor labels and dashboard buttons](../assets/issue-353/comparison.jpg)
+
+```yaml
+type: custom:easy-floorplan-card
+floorSwitcher:
+  style: buttons
+  layout: horizontal
+  'x': 200
+  'y': 152
+```
+
+Omit `x` and `y` to keep the top-right position. Classic (`style: default`) keeps the
+small labels and plan skin colours; Dashboard buttons use the dashboard theme even when
+the plan has a different skin. Both styles use each floor's existing `short` label and
+active `color`. The full name remains available as the tooltip and accessible name, and
+the selected floor is announced as pressed. Horizontal rows wrap on narrow cards.
+Moving the switcher or choosing **Back to the corner** preserves its style and layout.
+See the [phone and native editor checks](../assets/issue-353/README.md) for examples.
+
+For a custom look, set the switcher variables through your theme or
+[card-mod](https://github.com/thomasloven/lovelace-card-mod). They affect only floor
+buttons, leaving device badges and the rest of the plan's skin alone:
+
+```yaml
+card_mod:
+  style: |
+    ha-card {
+      --fp-floor-switcher-background: var(--secondary-background-color);
+      --fp-floor-switcher-color: var(--primary-text-color);
+      --fp-floor-switcher-active-background: #00695c;
+      --fp-floor-switcher-active-color: white;
+      --fp-floor-switcher-border-radius: 24px;
+      --fp-floor-switcher-border-width: 0px;
+      --fp-floor-switcher-padding: 12px 20px;
+      --fp-floor-switcher-gap: 8px;
+      --fp-floor-switcher-box-shadow: none;
+    }
+```
+
+All variables below start with `--fp-floor-switcher-`. Unset values come from the
+selected preset; explicit values override the preset and per-floor active colour.
+
+| Suffix | Controls |
+| --- | --- |
+| `background`, `color`, `border-color` | Resting button colours |
+| `active-background`, `active-color`, `active-border-color` | Selected button colours; active border defaults to the active background |
+| `border-width`, `border-radius`, `box-shadow` | Outline, corners and shadow |
+| `padding`, `gap` | Space inside and between buttons |
+| `font-size`, `font-weight` | Label typography |
+| `min-height`, `max-width` | Button dimensions; dashboard buttons default to at least 44px high, both styles limit labels to 120px wide |
+
+For CSS beyond these variables, card-mod can target `.floor-switcher`, `.floor-button`,
+`.floor-button.active`, or `[data-floor-id="your-floor-id"]`. For example:
+
+```yaml
+card_mod:
+  style: |
+    .floor-switcher .floor-button {
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+    .floor-switcher [data-floor-id="ground"].active {
+      background: linear-gradient(120deg, #00695c, #0277bd);
+      color: white;
+      border-color: transparent;
+    }
+```
+
+The card also exposes CSS parts `floor-switcher`, `floor-button` and
+`floor-button-active` for stylesheets outside its shadow root, for example
+`easy-floorplan-card::part(floor-button) { border-radius: 0; }`. These are styling hooks
+for the built-in floor controls; they do not embed other Lovelace cards. One-floor plans
+still have no switcher.
+
 ## Where the floor switcher sits
 
 The floor buttons have always been pinned to the plan's top-right corner. That is a guess
@@ -538,6 +619,81 @@ was rotated (issue #280).
 ![The same sensor at every rotation: before, the cone stays pointing up the screen while the wall moves; after, it follows the wall](img/ripple-direction-rotation.png)
 
 <a id="isometric-view"></a>
+
+## Live appearance and view controls
+
+Choose **Project → Display → Appearance → Line art** for a live architectural
+drawing of your existing plan. Enable **Show view controls** in the same group
+to give viewers these controls directly on the card:
+
+- **2D / 3D** changes the projection.
+- **Normal / Line art** changes the drawing style.
+- **Rotate left / right** moves through the four viewing directions in 90° steps.
+- **Reset view** returns to the saved view, appearance and rotation and zooms out.
+
+![Live line art with view controls and simulated devices](img/line-art-live-desktop.png)
+
+The same controls [wrap on a narrow screen](img/line-art-live-mobile.png).
+
+The controls are enabled for new plans; existing plans can opt in without changing
+their saved layout. Choose the initial appearance and view in the editor:
+
+```yaml
+view: 3d
+appearance: line-art
+showViewControls: true
+```
+
+Line art keeps entity readings, device actions, animated opening positions,
+furniture actions, floor switching and room zoom live. Light pools and state
+colours still show what is happening at home. The canvas uses white surfaces and
+dark outlines; standing walls become opaque and background images turn grayscale.
+Environmental sunlight, moonlight and night dimming pause while Line art is
+selected. **Normal** restores your configured colours, skin, opacity and lighting.
+
+View choices last while the card is mounted, including through entity updates
+and floor changes. They do not modify the saved configuration. Changing a saved
+default in the editor replaces the corresponding temporary choice; reloading the
+card also restores its defaults. Reset keeps the active floor selected. The 3D
+view uses the existing isometric renderer and four viewing corners, with no free
+orbit camera.
+
+The toolbar follows the Home Assistant theme, wraps for narrow cards, and supports
+keyboard focus and touch. Try the [live preview](../docker/README.md#live-appearance-preview)
+with simulated lights, doors and both themes.
+
+## SVG export
+
+Enable **Project → Display → Allow SVG download**, or add `showExport: true`, for
+an optional download button at the end of the view controls. Without view controls,
+it appears as **Export SVG** below the plan. Select a floor, then download it.
+The download uses the current 2D or 3D view and display rotation,
+including orientation overrides. It always includes the full canvas, even while
+zoomed into a room. Open the SVG directly in a browser, print it, or insert it into
+a document or vector editor.
+
+![Downloaded 3D line-art example](img/line-art-example.svg)
+
+```yaml
+showExport: true
+view: 3d
+wallHeight: 60
+```
+
+The file uses the live Line art's dark ink on white for walls, openings, furniture
+(including custom symbols), dividers and room names. It needs no Home Assistant connection, theme,
+external fonts or linked images. Openings use their static drawing convention:
+swing doors open and windows closed, respecting the configured inversion.
+Background images, free text, device badges, entity readings, lighting
+and replay state are omitted. The live card is unchanged by exporting.
+
+Standing faces are opaque and use the existing 3D painter's ordering to cover
+geometry behind them. This is an illustration in canvas units, not a survey or
+a general hidden-line CAD export. White faces and SVG masks remain in the file;
+it is intended for printing and documents, not optimised pen-plotter paths.
+
+Try the [local live preview](../docker/README.md#live-appearance-preview) to switch
+views and floors and download the example drawing.
 
 ## 3D view
 

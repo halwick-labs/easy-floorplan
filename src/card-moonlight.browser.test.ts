@@ -11,8 +11,8 @@ beforeEach(() => {
   vi.useFakeTimers({ now: Date.parse("2026-09-22T21:00:00Z"), toFake: ["Date", "setInterval", "clearInterval"] });
 });
 afterEach(() => {
-  vi.useRealTimers();
   document.body.innerHTML = "";
+  vi.useRealTimers();
 });
 
 const sun = (elevation: number) => ({
@@ -42,6 +42,63 @@ function mount(elevation: number, extra: Partial<FloorplanCardConfig> = {}): Flo
 
 const moonBeam = (card: FloorplanCard) =>
   card.shadowRoot!.querySelector<SVGPolygonElement>(".fp-moonlight .fp-sunbeam");
+
+const configOf = (card: FloorplanCard) =>
+  (card as unknown as { _config: FloorplanCardConfig })._config;
+
+async function clickViewControl(card: FloorplanCard, name: string): Promise<void> {
+  const button = [...card.shadowRoot!.querySelectorAll<HTMLButtonElement>(".view-controls button")]
+    .find((b) => (b.getAttribute("aria-label") || b.textContent?.trim()) === name)!;
+  button.click();
+  await card.updateComplete;
+}
+
+it("leaves the moon clock stopped for saved line art, including config updates and reset", async () => {
+  const idle = vi.getTimerCount();
+  const config = { appearance: "line-art", showViewControls: true } as const;
+  const card = mount(-27, config);
+  await card.updateComplete;
+  expect(moonBeam(card)).toBeNull();
+  expect(vi.getTimerCount()).toBe(idle);
+  card.setConfig({ ...configOf(card), title: "Renamed" });
+  await card.updateComplete;
+  expect(vi.getTimerCount()).toBe(idle);
+  await clickViewControl(card, "Normal");
+  expect(moonBeam(card)).not.toBeNull();
+  expect(vi.getTimerCount()).toBe(idle + 1);
+  await clickViewControl(card, "Reset view");
+  expect(moonBeam(card)).toBeNull();
+  expect(vi.getTimerCount()).toBe(idle);
+});
+
+it("pauses redraws in viewer line art and resumes one moon clock on Normal or reset", async () => {
+  const idle = vi.getTimerCount();
+  const card = mount(-27, { showViewControls: true });
+  await card.updateComplete;
+  expect(vi.getTimerCount()).toBe(idle + 1);
+  for (let i = 0; i < 2; i++) {
+    await clickViewControl(card, "Line art");
+    expect(vi.getTimerCount()).toBe(idle);
+    const update = vi.spyOn(card, "requestUpdate");
+    vi.advanceTimersByTime(MOON_TICK_MS);
+    expect(update).not.toHaveBeenCalled();
+    update.mockRestore();
+    card.setConfig({ ...configOf(card), title: `Renamed ${i}` });
+    await card.updateComplete;
+    expect(vi.getTimerCount()).toBe(idle);
+    await clickViewControl(card, i === 0 ? "Normal" : "Reset view");
+    expect(moonBeam(card)).not.toBeNull();
+    expect(vi.getTimerCount()).toBe(idle + 1);
+  }
+  card.remove();
+  expect(vi.getTimerCount()).toBe(idle);
+  document.body.append(card);
+  await card.updateComplete;
+  expect(vi.getTimerCount()).toBe(idle + 1);
+  card.setConfig({ ...configOf(card), moonlight: false });
+  await card.updateComplete;
+  expect(vi.getTimerCount()).toBe(idle);
+});
 
 it("lets the moon in after dark, in its own cool light (issue #201)", async () => {
   const card = mount(-27);
