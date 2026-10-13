@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { rectAreasOverlap } from "./area-push-tools";
+import {
+  coupleRectAreaSharedEdges,
+  coupleSharedBoundarySegment,
+  coupledEdgeResize,
+  moveAreaBoundary,
+  rectAreasOverlap,
+} from "./area-push-tools";
 import type { Area } from "./types";
 
 function area(id: string, points: Array<{ x: number; y: number }>): Area {
@@ -75,5 +81,138 @@ describe("rectAreasOverlap", () => {
       { x: 590, y: 300 },
     ]);
     expect(rectAreasOverlap(movedL, blocker)).toBe(true);
+  });
+});
+
+describe("moveAreaBoundary", () => {
+  it("moves only the vertices on the given side's boundary", () => {
+    const points = [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 10 },
+      { x: 0, y: 10 },
+    ];
+    const moved = moveAreaBoundary(points, { dx: 5, dy: 0 }, "right");
+    expect(moved).toEqual([
+      { x: 0, y: 0 },
+      { x: 25, y: 0 },
+      { x: 25, y: 10 },
+      { x: 0, y: 10 },
+    ]);
+  });
+
+  it("returns undefined when there is no moving side", () => {
+    const points = [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 10 }, { x: 0, y: 10 }];
+    expect(moveAreaBoundary(points, { dx: 5, dy: 0 })).toBeUndefined();
+  });
+});
+
+describe("coupleSharedBoundarySegment", () => {
+  it("carries a neighbor's coincident edge along with the moving one", () => {
+    const primary = [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 10 },
+      { x: 0, y: 10 },
+    ];
+    const other = [
+      { x: 20, y: 0 },
+      { x: 40, y: 0 },
+      { x: 40, y: 10 },
+      { x: 20, y: 10 },
+    ];
+    const coupled = coupleSharedBoundarySegment(primary, other, { dx: 5, dy: 0 }, "right");
+    expect(coupled).toEqual([
+      { x: 25, y: 0 },
+      { x: 40, y: 0 },
+      { x: 40, y: 10 },
+      { x: 25, y: 10 },
+    ]);
+  });
+
+  it("returns undefined when the two areas don't share the moving boundary", () => {
+    const primary = [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 10 }, { x: 0, y: 10 }];
+    const farAway = [{ x: 100, y: 0 }, { x: 120, y: 0 }, { x: 120, y: 10 }, { x: 100, y: 10 }];
+    expect(coupleSharedBoundarySegment(primary, farAway, { dx: 5, dy: 0 }, "right")).toBeUndefined();
+  });
+
+  it("returns undefined for a zero delta", () => {
+    const primary = [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 10 }, { x: 0, y: 10 }];
+    const other = [{ x: 20, y: 0 }, { x: 40, y: 0 }, { x: 40, y: 10 }, { x: 20, y: 10 }];
+    expect(coupleSharedBoundarySegment(primary, other, { dx: 0, dy: 0 }, "right")).toBeUndefined();
+  });
+});
+
+describe("coupleRectAreaSharedEdges", () => {
+  it("moves the primary area and couples its neighbor's shared edge", () => {
+    const primary = area("primary", [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 10 },
+      { x: 0, y: 10 },
+    ]);
+    const neighbor = area("neighbor", [
+      { x: 20, y: 0 },
+      { x: 40, y: 0 },
+      { x: 40, y: 10 },
+      { x: 20, y: 10 },
+    ]);
+
+    const result = coupleRectAreaSharedEdges(
+      "primary",
+      primary.points,
+      { dx: 5, dy: 0 },
+      [primary, neighbor],
+      "right"
+    );
+
+    expect(result.coupledIds).toEqual(new Set(["neighbor"]));
+    const updatedPrimary = result.areas.find((a) => a.id === "primary")!;
+    const updatedNeighbor = result.areas.find((a) => a.id === "neighbor")!;
+    expect(updatedPrimary.points.map((p) => p.x)).toEqual([0, 25, 25, 0]);
+    expect(updatedNeighbor.points.map((p) => p.x)).toEqual([25, 40, 40, 25]);
+  });
+
+  it("leaves unrelated areas untouched", () => {
+    const primary = area("primary", [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 10 }, { x: 0, y: 10 }]);
+    const unrelated = area("unrelated", [{ x: 100, y: 0 }, { x: 120, y: 0 }, { x: 120, y: 10 }, { x: 100, y: 10 }]);
+
+    const result = coupleRectAreaSharedEdges("primary", primary.points, { dx: 5, dy: 0 }, [primary, unrelated], "right");
+
+    expect(result.coupledIds.size).toBe(0);
+    expect(result.areas.find((a) => a.id === "unrelated")).toEqual(unrelated);
+  });
+});
+
+describe("coupledEdgeResize", () => {
+  it("applies the full delta when nothing blocks the coupled pair", () => {
+    const primary = area("primary", [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 10 }, { x: 0, y: 10 }]);
+    const neighbor = area("neighbor", [{ x: 20, y: 0 }, { x: 40, y: 0 }, { x: 40, y: 10 }, { x: 20, y: 10 }]);
+
+    const result = coupledEdgeResize("primary", primary, { dx: 5, dy: 0 }, [primary, neighbor], "right");
+
+    expect(result.delta).toEqual({ dx: 5, dy: 0 });
+    const updatedNeighbor = result.areas.find((a) => a.id === "neighbor")!;
+    expect(Math.min(...updatedNeighbor.points.map((p) => p.x))).toBeCloseTo(25);
+  });
+
+  it("collapses to no movement when the coupled pair would overlap an obstacle at any scale", () => {
+    const primary = area("primary", [{ x: 0, y: 0 }, { x: 20, y: 0 }, { x: 20, y: 10 }, { x: 0, y: 10 }]);
+    const neighbor = area("neighbor", [{ x: 20, y: 0 }, { x: 40, y: 0 }, { x: 40, y: 10 }, { x: 20, y: 10 }]);
+    // Sits inside the primary/neighbor pair's combined footprint, which is
+    // invariant under this move (the shared edge just slides between them) —
+    // so it overlaps one of the two at every scale, and the safe fraction
+    // the binary search converges on is ~0.
+    const obstacle = area("obstacle", [{ x: 25, y: 0 }, { x: 35, y: 0 }, { x: 35, y: 10 }, { x: 25, y: 10 }]);
+
+    const result = coupledEdgeResize(
+      "primary",
+      primary,
+      { dx: 10, dy: 0 },
+      [primary, neighbor, obstacle],
+      "right"
+    );
+
+    expect(Math.abs(result.delta.dx)).toBeLessThan(0.01);
   });
 });

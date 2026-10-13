@@ -3,11 +3,13 @@ import type {
   AreaPoint,
   RectAreaSide,
   RectAreaSideWallSegment,
+  RectAreaSideWallState,
   RectAreaSideWallValue,
 } from "./types";
 import { RECT_AREA_SIDES } from "./types";
 import {
   RECT_AREA_EPSILON,
+  polygonEdgeSide,
   rectAreaClamp,
   rectAreaPoints,
   rectAreaSharedSides,
@@ -18,7 +20,7 @@ import { coupleSharedBoundarySegment } from "./area-push-tools";
 import { signedArea, traceFaces } from "./dead-space";
 import { pointInPolygon } from "./render";
 
-const AREA_TOOLS_DEBUG = true;
+const AREA_TOOLS_DEBUG = false;
 const AREA_TOOLS_DEBUG_MAX_CHARS = 1200;
 const AREA_TOOLS_REPEAT_SUMMARY_EVERY = 20;
 const AREA_TOOLS_LABEL_ALLOW = [
@@ -108,6 +110,8 @@ export function segmentWindowAt(t: number, span = 0.3): { start: number; end: nu
   return { start, end };
 }
 
+// On overlap between segments of different states, the earlier (lower
+// `start`) segment wins; the later one is trimmed back to the boundary.
 export function normalizeRectAreaSideSegments(
   segments: RectAreaSideWallSegment[]
 ): RectAreaSideWallSegment[] {
@@ -148,6 +152,8 @@ export function rectAreaEdgeFraction(
   point?: { x: number; y: number }
 ): number {
   if (!point) return 0.5;
+  // (0, 0) is editor.ts's sentinel for a synthetic click with no real pointer
+  // coords (see `_rectAreaEdgeFraction`'s `ev.clientX === 0 && ev.clientY === 0` check).
   if (point.x === 0 && point.y === 0) return 0.5;
   const p = area.points[edgeIndex];
   const next = area.points[(edgeIndex + 1) % area.points.length];
@@ -174,42 +180,27 @@ export function rectAreaOppositeSide(side: RectAreaSide): RectAreaSide {
 }
 
 export function rectAreaEdgeSide(area: Area, edgeIndex: number): RectAreaSide {
-  const points = area.points;
-  const len = points.length;
-  const p = points[edgeIndex];
-  const next = points[(edgeIndex + 1) % len];
-  if (!p || !next) return RECT_AREA_SIDES[edgeIndex % RECT_AREA_SIDES.length];
+  return polygonEdgeSide(area.points, edgeIndex) ?? RECT_AREA_SIDES[edgeIndex % RECT_AREA_SIDES.length];
+}
 
-  let dx = next.x - p.x;
-  let dy = next.y - p.y;
-
-  if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
-    for (let step = 1; step < len; step++) {
-      const prev = points[(edgeIndex - step + len) % len];
-      const forward = points[(edgeIndex + step) % len];
-      if (!prev || !forward) continue;
-      const prevDx = forward.x - prev.x;
-      const prevDy = forward.y - prev.y;
-      if (Math.abs(prevDx) > RECT_AREA_EPSILON || Math.abs(prevDy) > RECT_AREA_EPSILON) {
-        dx = prevDx;
-        dy = prevDy;
-        break;
-      }
-    }
-    if (Math.abs(dx) <= RECT_AREA_EPSILON && Math.abs(dy) <= RECT_AREA_EPSILON) {
-      return RECT_AREA_SIDES[edgeIndex % RECT_AREA_SIDES.length];
-    }
-  }
-
-  const areaSign = signedArea(points);
-  const outward = areaSign >= 0
-    ? { x: dy, y: -dx }
-    : { x: -dy, y: dx };
-
-  if (Math.abs(outward.x) > Math.abs(outward.y)) {
-    return outward.x > 0 ? "right" : "left";
-  }
-  return outward.y > 0 ? "bottom" : "top";
+/** Normalize `segments` and fold them into `a.sideWalls[side]`, collapsing a
+ * single full-edge segment back to its plain string form. Shared by
+ * `toggleRectAreaSide` and `splitRectAreaSide` so the two don't drift apart. */
+function applySideWallSegments(
+  a: Area,
+  side: RectAreaSide,
+  segments: RectAreaSideWallSegment[]
+): { updated: Area; normalized: RectAreaSideWallSegment[] } {
+  const normalized = normalizeRectAreaSideSegments(segments);
+  const sideWalls = { ...(a.sideWalls ?? {}) };
+  if (!normalized.length) delete sideWalls[side];
+  else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
+    sideWalls[side] = normalized[0]!.state;
+  else sideWalls[side] = normalized;
+  return {
+    updated: { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined },
+    normalized,
+  };
 }
 
 export function toggleRectAreaSide(
@@ -249,7 +240,7 @@ export function toggleRectAreaSide(
     let currentState: "none" | "wall" | "divider" = "none";
     if (existing.length) {
       let cursor = targetStart;
-      let state: "wall" | "divider" | undefined;
+      let state: RectAreaSideWallState | undefined;
       let fullCoverage = true;
       for (const segment of existing) {
         const segStart = Math.max(targetStart, segment.start);
@@ -290,13 +281,7 @@ export function toggleRectAreaSide(
       nextSegments.push({ start: targetStart, end: targetEnd, state: nextState });
     }
 
-    const normalized = normalizeRectAreaSideSegments(nextSegments);
-    const sideWalls = { ...(a.sideWalls ?? {}) };
-    if (!normalized.length) delete sideWalls[side];
-    else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
-      sideWalls[side] = normalized[0]!.state;
-    else sideWalls[side] = normalized;
-    const updated = { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+    const { updated, normalized } = applySideWallSegments(a, side, nextSegments);
     areaToolsDebug("toggleRectAreaSide:after-interval", {
       areaId: a.id,
       side,
@@ -328,13 +313,7 @@ export function toggleRectAreaSide(
       nextSegments.push({ start: w.start, end: w.end, state: "wall" });
     }
 
-    const normalized = normalizeRectAreaSideSegments(nextSegments);
-    const sideWalls = { ...(a.sideWalls ?? {}) };
-    if (!normalized.length) delete sideWalls[side];
-    else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
-      sideWalls[side] = normalized[0]!.state;
-    else sideWalls[side] = normalized;
-    const updated = { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+    const { updated, normalized } = applySideWallSegments(a, side, nextSegments);
     areaToolsDebug("toggleRectAreaSide:after-array", {
       areaId: a.id,
       side,
@@ -399,12 +378,7 @@ export function splitRectAreaSide(
     segments.push({ start: segmentWindow.start, end: segmentWindow.end, state });
   }
 
-  const normalized = normalizeRectAreaSideSegments(segments);
-  if (!normalized.length) delete sideWalls[side];
-  else if (normalized.length === 1 && normalized[0]!.start <= RECT_AREA_EPSILON && normalized[0]!.end >= 1 - RECT_AREA_EPSILON)
-    sideWalls[side] = normalized[0]!.state;
-  else sideWalls[side] = normalized;
-  return { ...a, sideWalls: Object.keys(sideWalls).length ? sideWalls : undefined };
+  return applySideWallSegments(a, side, segments).updated;
 }
 
 export function rectAreaUnionPoints(a: AreaPoint[], other: AreaPoint[]): AreaPoint[] | undefined {

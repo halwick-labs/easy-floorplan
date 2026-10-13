@@ -1,6 +1,14 @@
 import type { Area, RectAreaSide, RectAreaSideWallState } from "./types";
 import { RECT_AREA_EPSILON, rectAreaSideBoundarySegments, rectAreaSideWallSegments } from "./editor-geometry";
 
+/**
+ * Smallest allowed span, as a fraction of the side's length, for a wall
+ * segment being dragged. Independent of {@link RECT_AREA_EPSILON} (a
+ * near-zero tolerance for float comparisons) — this is a usability floor so a
+ * segment can't be dragged down to an unselectably thin sliver.
+ */
+export const MIN_WALL_SEGMENT_SPAN = 0.02;
+
 export type AreaWallSegmentDragMode = "segment" | "start" | "end";
 
 export interface AreaWallSegmentDrag {
@@ -30,7 +38,7 @@ export function applyAreaWallSegmentDrag(
     drag.side === "top" || drag.side === "bottom"
       ? moveX / totalLength
       : moveY / totalLength;
-  const minSpan = 0.02;
+  const minSpan = MIN_WALL_SEGMENT_SPAN;
   let nextStart = drag.start;
   let nextEnd = drag.end;
 
