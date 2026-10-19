@@ -5,6 +5,7 @@ import {
   removeAreaWallSegment,
   type AreaWallSegmentDrag,
 } from "./area-wall-segment-tools";
+import { rectAreaSideWallSegments } from "./editor-geometry";
 import type { Area } from "./types";
 
 function rectangleArea(): Area {
@@ -64,6 +65,44 @@ describe("applyAreaWallSegmentDrag", () => {
     const segment = (updated!.sideWalls!.top as Array<{ start: number; end: number }>)[0]!;
     expect(segment.start).toBeCloseTo(0.7);
     expect(segment.end).toBeCloseTo(1);
+  });
+
+  it("clamps a divider at a neighboring wall instead of overwriting it after sorting", () => {
+    const area = {
+      ...rectangleArea(),
+      points: [
+        { x: 0, y: 0 },
+        { x: 100, y: 0 },
+        { x: 100, y: 100 },
+        { x: 0, y: 100 },
+      ],
+      sideWalls: {
+        top: [
+          { start: 0.1, end: 0.3, state: "wall" as const },
+          { start: 0.6, end: 0.8, state: "divider" as const },
+        ],
+      },
+    } as Area;
+
+    const moved = applyAreaWallSegmentDrag(
+      area,
+      baseDrag({ segmentIndex: 1, start: 0.6, end: 0.8, state: "divider" }),
+      -55,
+      0
+    )!;
+    const sorted = rectAreaSideWallSegments(moved.sideWalls?.top);
+    expect(sorted).toEqual([
+      { start: 0.1, end: 0.3, state: "wall" },
+      { start: 0.3, end: 0.5, state: "divider" },
+    ]);
+
+    const movedAgain = applyAreaWallSegmentDrag(
+      moved,
+      baseDrag({ segmentIndex: 1, start: 0.3, end: 0.5, state: "divider" }),
+      -1,
+      0
+    )!;
+    expect(rectAreaSideWallSegments(movedAgain.sideWalls?.top)).toEqual(sorted);
   });
 
   it("drags only the start edge, never crossing the end minus the minimum span", () => {

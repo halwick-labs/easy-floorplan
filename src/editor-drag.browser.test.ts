@@ -1506,10 +1506,14 @@ describe("editor drag", () => {
 
     const sideWalls = (ed as any)._floor().areas[0].sideWalls?.top;
     expect(Array.isArray(sideWalls)).toBe(true);
-    expect(sideWalls).toHaveLength(1);
-    expect(sideWalls[0].state).toBe("wall");
-    expect(sideWalls[0].start).toBeGreaterThan(0);
-    expect(sideWalls[0].end).toBeLessThan(1);
+    expect(sideWalls).toHaveLength(3);
+    expect(sideWalls.map((segment: any) => segment.state)).toEqual(["wall", "wall", "wall"]);
+    expect(sideWalls[0].start).toBeCloseTo(0, 8);
+    expect(sideWalls[0].end).toBeCloseTo(0.35, 8);
+    expect(sideWalls[1].start).toBeCloseTo(0.35, 8);
+    expect(sideWalls[1].end).toBeCloseTo(0.65, 8);
+    expect(sideWalls[2].start).toBeCloseTo(0.65, 8);
+    expect(sideWalls[2].end).toBeCloseTo(1, 8);
 
     document.body.innerHTML = "";
   });
@@ -1629,6 +1633,55 @@ describe("editor drag", () => {
     await ed.updateComplete;
 
     expect((ed as any)._selectedWallSegment).toEqual({ areaId: "room1", side: "top", edgeIndex: 0, segmentIndex: 1 });
+    document.body.innerHTML = "";
+  });
+
+  it("maps every generated piece of a later segment back to that segment", async () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 200 },
+      { x: 200, y: 200 },
+      { x: 200, y: 300 },
+      { x: 100, y: 300 },
+    ];
+    const ed = await mountAreaEditor(points, {
+      right: [
+        { start: 0.1, end: 0.2, state: "divider" },
+        { start: 0.3, end: 0.8, state: "wall" },
+      ],
+    });
+    (ed as any)._areaEdgeModifier = "split";
+    await ed.updateComplete;
+
+    const pieces = [...ed.shadowRoot!.querySelectorAll<SVGLineElement>(".wall-hit")]
+      .filter((line) => Math.abs(Number(line.getAttribute("x1")) - 200) < 1e-6 &&
+        Math.min(Number(line.getAttribute("y1")), Number(line.getAttribute("y2"))) >= 200);
+    expect(pieces).toHaveLength(1);
+    const piece = pieces[0]!;
+    expect(piece.classList.contains("side-wall-edge")).toBe(true);
+    const toggle = piece.parentElement!.querySelector<SVGPathElement>(".area-wall-toggle");
+    expect(toggle).toBeTruthy();
+    expect(toggle!.classList.contains("wall")).toBe(true);
+    expect(toggle!.className.baseVal).not.toContain("[object Object]");
+    expect(toggle!.getAttribute("title")).not.toContain("[object Object]");
+    const at = center(piece);
+    piece.dispatchEvent(new MouseEvent("click", {
+      bubbles: true,
+      composed: true,
+      cancelable: true,
+      ctrlKey: true,
+      clientX: at.x,
+      clientY: at.y,
+    }));
+    await ed.updateComplete;
+
+    expect((ed as any)._selectedWallSegment).toEqual({
+      areaId: "room1",
+      side: "right",
+      edgeIndex: 3,
+      segmentIndex: 1,
+    });
     document.body.innerHTML = "";
   });
 
@@ -2268,6 +2321,62 @@ describe("editor drag", () => {
     expect(after.end).toBeGreaterThan(before.end);
     expect(after.end - after.start).toBeCloseTo(before.end - before.start, 3);
 
+    document.body.innerHTML = "";
+  });
+
+  it("clamps a selected wall segment at its neighbor across successive drag frames", async () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 200, y: 100 },
+      { x: 200, y: 200 },
+      { x: 100, y: 200 },
+    ];
+    const ed = await mountAreaEditor(points, {
+      top: [
+        { start: 0.1, end: 0.3, state: "wall" },
+        { start: 0.6, end: 0.8, state: "wall" },
+      ],
+    });
+    (ed as any)._areaEdgeModifier = "split";
+    await ed.updateComplete;
+
+    const lines = [...ed.shadowRoot!.querySelectorAll<SVGLineElement>(".wall-hit.side-wall-edge")];
+    expect(lines).toHaveLength(2);
+    const draggedLine = lines[1]!;
+    const svg = ed.shadowRoot!.querySelector("svg") as SVGSVGElement;
+    const start = screenPoint(svg, 170, 100);
+    const firstMove = screenPoint(svg, 115, 100);
+    const secondMove = screenPoint(svg, 114, 100);
+    const dispatch = (type: string, at: { x: number; y: number }, ctrlKey = false) =>
+      draggedLine.dispatchEvent(new PointerEvent(type, {
+        bubbles: true,
+        composed: true,
+        cancelable: true,
+        pointerId: POINTER_ID,
+        pointerType: "mouse",
+        isPrimary: true,
+        button: 0,
+        buttons: type === "pointerup" ? 0 : 1,
+        ctrlKey,
+        clientX: at.x,
+        clientY: at.y,
+      }));
+
+    dispatch("pointerdown", start, true);
+    dispatch("pointermove", firstMove, true);
+    await frame();
+    await ed.updateComplete;
+    dispatch("pointermove", secondMove, true);
+    await frame();
+    await ed.updateComplete;
+    dispatch("pointerup", secondMove, true);
+    await ed.updateComplete;
+
+    expect(rectAreaSideWallSegments((ed as any)._floor().areas[0].sideWalls?.top)).toEqual([
+      { start: 0.1, end: 0.3, state: "wall" },
+      { start: 0.3, end: 0.5, state: "wall" },
+    ]);
+    expect((ed as any)._selectedWallSegment?.segmentIndex).toBe(1);
     document.body.innerHTML = "";
   });
 
@@ -3334,8 +3443,11 @@ describe("editor drag", () => {
     await ed.updateComplete;
 
     const edges = ed.shadowRoot!.querySelectorAll<SVGLineElement>(".area-edge-hit");
-    const shared = [...edges].find((el) => Number.parseFloat(el.getAttribute("x1") ?? "0") <= 20) ?? edges[0];
-    shared.dispatchEvent(
+    const shared = [...edges].find((el) =>
+      el.dataset.areaId === "right" && el.dataset.edgeIndex === "3"
+    );
+    expect(shared).toBeTruthy();
+    shared!.dispatchEvent(
       new MouseEvent("click", { bubbles: true, composed: true, cancelable: true, shiftKey: true })
     );
     await ed.updateComplete;
@@ -3534,7 +3646,7 @@ describe("editor drag", () => {
     document.body.innerHTML = "";
   });
 
-  it("shows a ready join cursor when a rectangle borders a rectilinear polygon edge", async () => {
+  it("shows an invalid join cursor when a rectangle borders a polygon edge", async () => {
     const host = document.createElement("div");
     host.style.width = "900px";
     document.body.appendChild(host);
@@ -3581,7 +3693,9 @@ describe("editor drag", () => {
     await ed.updateComplete;
 
     const rectangle = (ed as any)._floor().areas.find((area: any) => area.id === "rectangle");
-    expect((ed as any)._rectAreaEdgeModifierClass(rectangle, 1)).toBe("modifier-ready");
+    expect((ed as any)._rectAreaEdgeModifierClass(rectangle, 1)).toBe("modifier-invalid");
+    (ed as any)._mergeRectAreaSide(rectangle, 1);
+    expect((ed as any)._floor().areas).toHaveLength(2);
 
     document.body.innerHTML = "";
   });
@@ -3721,6 +3835,48 @@ describe("editor drag", () => {
     document.body.innerHTML = "";
   });
 
+  it("does not offer edge-resize handles for diagonal polygons", async () => {
+    const points = [
+      { x: 100, y: 100 },
+      { x: 300, y: 100 },
+      { x: 300, y: 240 },
+      { x: 180, y: 180 },
+      { x: 100, y: 240 },
+    ];
+    const ed = await mountAreaEditor(points);
+    expect(ed.shadowRoot!.querySelectorAll(".area-edge-hit")).toHaveLength(0);
+    expect(ed.shadowRoot!.querySelectorAll(".area-edge-handle")).toHaveLength(0);
+    document.body.innerHTML = "";
+  });
+
+  it("rejects an L-shape edge resize that crosses the opposite arm", async () => {
+    const points = [
+      { x: 0, y: 0 },
+      { x: 200, y: 0 },
+      { x: 200, y: 100 },
+      { x: 100, y: 100 },
+      { x: 100, y: 200 },
+      { x: 0, y: 200 },
+    ];
+    const ed = await mountAreaEditor(points);
+    const svg = ed.shadowRoot!.querySelector("svg") as SVGSVGElement;
+    const edge = ed.shadowRoot!.querySelector<SVGLineElement>(
+      '.area-edge-hit[data-area-id="room1"][data-edge-index="2"]'
+    );
+    expect(edge).toBeTruthy();
+    const from = screenPoint(svg, 150, 100);
+    const to = screenPoint(svg, 150, 250);
+    pointer(edge!, "pointerdown", from.x, from.y);
+    pointer(edge!, "pointermove", to.x, to.y);
+    await frame();
+    await ed.updateComplete;
+    pointer(edge!, "pointerup", to.x, to.y);
+    await ed.updateComplete;
+
+    expect((ed as any)._floor().areas[0].points).toEqual(points);
+    document.body.innerHTML = "";
+  });
+
   it("shows valid and invalid join cursors while the shift modifier is active", async () => {
     const host = document.createElement("div");
     host.style.width = "900px";
@@ -3771,6 +3927,17 @@ describe("editor drag", () => {
 
     expect(shared.classList.contains("modifier-ready")).toBe(true);
     expect(invalid.classList.contains("modifier-invalid")).toBe(true);
+
+    window.dispatchEvent(new KeyboardEvent("keyup", {
+      key: "Shift",
+      ctrlKey: true,
+      shiftKey: false,
+      bubbles: true,
+    }));
+    await ed.updateComplete;
+    expect((ed as any)._areaEdgeModifier).toBe("split");
+    expect(shared.classList.contains("modifier-split")).toBe(true);
+    expect(shared.classList.contains("modifier-ready")).toBe(false);
 
     document.body.innerHTML = "";
   });

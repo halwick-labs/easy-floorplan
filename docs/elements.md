@@ -223,8 +223,9 @@ point on an edge to split off just that section as its own segment (and select i
 or Shift-click an existing wall/divider to split it the same way without selecting
 it; drag a selected segment's midpoint to slide the whole segment along the edge, or
 an endpoint handle to stretch just that end, and press **Delete** to remove it.
-Shift-click an *open* section of an edge instead to join the room with an adjoining,
-same-size rectangle room into one.
+Shift-click an *open section of the actual shared edge* instead to join two
+adjoining rectangle rooms. If either room is linked to a Home Assistant area, both
+must be linked to the same area; two unlinked rooms may also join.
 
 Selected, an area offers **Name** / **Show name**, a **color** and **Fill opacity**, and —
 once it's live — the same conditional coloring devices get: **Entity**, **Active color**,

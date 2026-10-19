@@ -19,6 +19,8 @@ import {
   rectAreaEdgeResize,
   rectAreaHasMinimumSize,
   isRectilinearArea,
+  isValidRectilinearArea,
+  isValidRectilinearAreaResize,
   rectAreaSideWalls,
   rectAreaSideBoundarySegments,
   rectAreaSideWallNext,
@@ -388,6 +390,88 @@ describe("isRectilinearArea", () => {
       { x: 150, y: 150 },
       { x: 100, y: 220 },
     ])).toBe(false);
+  });
+
+  it("accepts repeated adjacent vertices when the nonzero edges remain orthogonal", () => {
+    expect(isRectilinearArea([
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 10 },
+      { x: 0, y: 10 },
+    ])).toBe(true);
+  });
+});
+
+describe("isValidRectilinearArea", () => {
+  it("accepts repeated adjacent vertices after treating zero-length edges as one vertex", () => {
+    expect(isValidRectilinearArea([
+      { x: 0, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 10 },
+      { x: 0, y: 10 },
+    ])).toBe(true);
+  });
+
+  it("rejects a self-intersecting rectilinear outline and a collapsed arm", () => {
+    expect(isValidRectilinearArea([
+      { x: 0, y: 0 },
+      { x: 4, y: 0 },
+      { x: 4, y: 4 },
+      { x: 2, y: 4 },
+      { x: 2, y: 1 },
+      { x: 3, y: 1 },
+      { x: 3, y: 3 },
+      { x: 1, y: 3 },
+      { x: 1, y: 4 },
+      { x: 0, y: 4 },
+    ])).toBe(false);
+    expect(isValidRectilinearArea([
+      { x: 0, y: 0 },
+      { x: 200, y: 0 },
+      { x: 200, y: 100 },
+      { x: 100, y: 100 },
+      { x: 100, y: 100 },
+      { x: 0, y: 200 },
+    ])).toBe(false);
+  });
+});
+
+describe("isValidRectilinearAreaResize", () => {
+  it("rejects an L-shaped edge resize that reverses an arm past its neighbor", () => {
+    const before = [
+      { x: 0, y: 0 },
+      { x: 200, y: 0 },
+      { x: 200, y: 100 },
+      { x: 100, y: 100 },
+      { x: 100, y: 200 },
+      { x: 0, y: 200 },
+    ];
+    const after = before.map((point, index) =>
+      index === 2 || index === 3 ? { ...point, y: 250 } : { ...point }
+
+  it("rejects a resize that collapses a previously nonzero arm edge", () => {
+    const before = [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 10 },
+      { x: 10, y: 10 },
+      { x: 10, y: 20 },
+      { x: 0, y: 20 },
+    ];
+    const after = [
+      { x: 0, y: 0 },
+      { x: 20, y: 0 },
+      { x: 20, y: 0 },
+      { x: 10, y: 0 },
+      { x: 10, y: 20 },
+      { x: 0, y: 20 },
+    ];
+    expect(isValidRectilinearAreaResize(before, after)).toBe(false);
+  });
+    );
+    expect(isValidRectilinearAreaResize(before, after)).toBe(false);
   });
 });
 

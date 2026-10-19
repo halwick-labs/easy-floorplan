@@ -39,40 +39,39 @@ export function applyAreaWallSegmentDrag(
       ? moveX / totalLength
       : moveY / totalLength;
   const minSpan = MIN_WALL_SEGMENT_SPAN;
-  let nextStart = drag.start;
-  let nextEnd = drag.end;
-
-  if (drag.mode === "segment") {
-    const width = drag.end - drag.start;
-    nextStart = drag.start + deltaFrac;
-    nextEnd = drag.end + deltaFrac;
-    if (nextStart < 0) {
-      nextEnd -= nextStart;
-      nextStart = 0;
-    }
-    if (nextEnd > 1) {
-      const overflow = nextEnd - 1;
-      nextStart -= overflow;
-      nextEnd = 1;
-    }
-    if (nextEnd - nextStart < minSpan) nextEnd = Math.min(1, nextStart + Math.max(minSpan, width));
-  } else if (drag.mode === "start") {
-    nextStart = Math.max(0, Math.min(drag.end - minSpan, drag.start + deltaFrac));
-  } else {
-    nextEnd = Math.min(1, Math.max(drag.start + minSpan, drag.end + deltaFrac));
-  }
-
   const sideWalls = { ...(area.sideWalls ?? {}) };
   const segments = rectAreaSideWallSegments(sideWalls[drag.side]).map((segment) => ({ ...segment }));
   if (!segments[drag.segmentIndex]) return undefined;
+  const matchesDrag = (segment: typeof segments[number]): boolean =>
+    segment.state === drag.state &&
+    Math.abs(segment.start - drag.start) <= RECT_AREA_EPSILON &&
+    Math.abs(segment.end - drag.end) <= RECT_AREA_EPSILON;
+  const segmentIndex = segments.findIndex(matchesDrag);
+  if (segmentIndex < 0) return undefined;
 
-  segments[drag.segmentIndex] = {
-    ...segments[drag.segmentIndex]!,
-    start: nextStart,
-    end: nextEnd,
+  const current = segments[segmentIndex]!;
+  const previousEnd = segmentIndex > 0 ? segments[segmentIndex - 1]!.end : 0;
+  const nextNeighborStart = segmentIndex < segments.length - 1 ? segments[segmentIndex + 1]!.start : 1;
+
+  let start = current.start;
+  let end = current.end;
+  if (drag.mode === "segment") {
+    const width = current.end - current.start;
+    start = Math.max(previousEnd, Math.min(nextNeighborStart - width, current.start + deltaFrac));
+    end = start + width;
+  } else if (drag.mode === "start") {
+    start = Math.max(previousEnd, Math.min(current.end - minSpan, current.start + deltaFrac));
+  } else {
+    end = Math.min(nextNeighborStart, Math.max(current.start + minSpan, current.end + deltaFrac));
+  }
+
+  segments[segmentIndex] = {
+    ...current,
+    start,
+    end,
     state: drag.state,
   };
-  sideWalls[drag.side] = segments;
+  sideWalls[drag.side] = segments.sort((a, b) => a.start - b.start);
   return { ...area, sideWalls };
 }
 

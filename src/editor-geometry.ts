@@ -70,15 +70,17 @@ export function isRectArea(points: readonly AreaPoint[]): boolean {
 /** Whether every edge is axis-aligned (horizontal or vertical). */
 export function isRectilinearArea(points: readonly AreaPoint[]): boolean {
   if (points.length < 4) return false;
+  let nonDegenerateEdges = 0;
   for (let i = 0; i < points.length; i++) {
     const a = points[i]!;
     const b = points[(i + 1) % points.length]!;
     const dx = Math.abs(b.x - a.x);
     const dy = Math.abs(b.y - a.y);
-    if (dx <= RECT_AREA_EPSILON && dy <= RECT_AREA_EPSILON) return false;
+    if (dx <= RECT_AREA_EPSILON && dy <= RECT_AREA_EPSILON) continue;
     if (dx > RECT_AREA_EPSILON && dy > RECT_AREA_EPSILON) return false;
+    nonDegenerateEdges++;
   }
-  return true;
+  return nonDegenerateEdges >= 4;
 }
 
 function polygonSignedArea(points: readonly AreaPoint[]): number {
@@ -124,27 +126,60 @@ function segmentIntersection(
 }
 
 function hasSelfIntersection(points: readonly AreaPoint[]): boolean {
-  const n = points.length;
+  const ring = points.filter((point, index) => {
+    if (index === 0) return true;
+    const previous = points[index - 1]!;
+    return Math.abs(point.x - previous.x) > RECT_AREA_EPSILON ||
+      Math.abs(point.y - previous.y) > RECT_AREA_EPSILON;
+  });
+  while (ring.length > 1 &&
+    Math.abs(ring[0]!.x - ring[ring.length - 1]!.x) <= RECT_AREA_EPSILON &&
+    Math.abs(ring[0]!.y - ring[ring.length - 1]!.y) <= RECT_AREA_EPSILON) {
+    ring.pop();
+  }
+  const n = ring.length;
   for (let i = 0; i < n; i++) {
-    const a1 = points[i]!;
-    const a2 = points[(i + 1) % n]!;
+    const a1 = ring[i]!;
+    const a2 = ring[(i + 1) % n]!;
     for (let j = i + 1; j < n; j++) {
       const adjacent = j === i || j === (i + 1) % n || i === (j + 1) % n;
       if (adjacent) continue;
-      const b1 = points[j]!;
-      const b2 = points[(j + 1) % n]!;
+      const b1 = ring[j]!;
+      const b2 = ring[(j + 1) % n]!;
       if (segmentIntersection(a1, a2, b1, b2)) return true;
     }
   }
   return false;
 }
 
-function isValidRectilinearPolygon(points: readonly AreaPoint[]): boolean {
+export function isValidRectilinearArea(points: readonly AreaPoint[]): boolean {
   return (
     isRectilinearArea(points) &&
     Math.abs(polygonSignedArea(points)) > RECT_AREA_EPSILON &&
     !hasSelfIntersection(points)
   );
+}
+
+/** A legal resize must stay rectilinear/simple and must not flip an arm past its neighbor. */
+export function isValidRectilinearAreaResize(
+  before: readonly AreaPoint[],
+  after: readonly AreaPoint[]
+): boolean {
+  if (before.length !== after.length || !isValidRectilinearArea(after)) return false;
+  for (let i = 0; i < before.length; i++) {
+    const oldStart = before[i]!;
+    const oldEnd = before[(i + 1) % before.length]!;
+    const newStart = after[i]!;
+    const newEnd = after[(i + 1) % after.length]!;
+    const oldDx = oldEnd.x - oldStart.x;
+    const oldDy = oldEnd.y - oldStart.y;
+    const newDx = newEnd.x - newStart.x;
+    const newDy = newEnd.y - newStart.y;
+    if (Math.hypot(oldDx, oldDy) > RECT_AREA_EPSILON && Math.hypot(newDx, newDy) <= RECT_AREA_EPSILON) return false;
+    const reversedDirectionThreshold = -(RECT_AREA_EPSILON * RECT_AREA_EPSILON);
+    if (oldDx * newDx < reversedDirectionThreshold || oldDy * newDy < reversedDirectionThreshold) return false;
+  }
+  return true;
 }
 
 /** Smallest legal width or height for a rectangle room in virtual units. */
@@ -198,7 +233,7 @@ export function rectilinearAreaVertexResize(
   else if (nextVertical && !nextHorizontal) out[nextIdx] = { ...out[nextIdx]!, x: target.x };
 
   out[idx] = { x: target.x, y: target.y };
-  return isValidRectilinearPolygon(out) ? out : points.map((point) => ({ ...point }));
+  return isValidRectilinearArea(out) ? out : points.map((point) => ({ ...point }));
 }
 
 /** Resize a rectangle area by moving one edge and keeping the opposite edge fixed. */

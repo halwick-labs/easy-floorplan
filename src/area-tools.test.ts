@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { rectAreaUnionPoints, splitRectAreaSide, toggleRectAreaSide } from "./area-tools";
+import {
+  mergeRectAreaSide,
+  rectAreaEdgeModifierClass,
+  rectAreaUnionPoints,
+  splitRectAreaSide,
+  toggleRectAreaSide,
+} from "./area-tools";
 import { rectAreaSideWallSegments, RECT_AREA_EPSILON } from "./editor-geometry";
 import { signedArea } from "./dead-space";
 import type { Area } from "./types";
@@ -111,6 +117,18 @@ describe("toggleRectAreaSide without a target interval", () => {
 });
 
 describe("splitRectAreaSide places the new segment at the clicked point", () => {
+  it("splits a full-edge wall into three wall ranges without removing the rest", () => {
+    const base = rectangleArea();
+    base.sideWalls = { top: "wall" };
+
+    const updated = splitRectAreaSide(base, 0, 0.5);
+    expect(rectAreaSideWallSegments(updated!.sideWalls?.top)).toEqual([
+      { start: 0, end: 0.35, state: "wall" },
+      { start: 0.35, end: 0.65, state: "wall" },
+      { start: 0.65, end: 1, state: "wall" },
+    ]);
+  });
+
   it("creates a segment containing the clicked point on a side with no existing wall", () => {
     const base = rectangleArea();
 
@@ -233,5 +251,92 @@ describe("rectAreaUnionPoints", () => {
       { x: 5, y: 5 },
     ];
     expect(rectAreaUnionPoints(point, point)).toBeUndefined();
+  });
+});
+
+describe("mergeRectAreaSide", () => {
+  const roomA: Area = {
+    id: "a",
+    haArea: "living-room",
+    points: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }],
+    sideWalls: { top: "wall", right: "divider" },
+  } as Area;
+  const roomB: Area = {
+    id: "b",
+    haArea: "living-room",
+    points: [{ x: 100, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 100 }, { x: 100, y: 100 }],
+    sideWalls: { left: "wall", right: "wall", bottom: "divider" },
+  } as Area;
+
+  it("preserves and reprojects both rooms' exterior walls/dividers while dropping the shared side", () => {
+    const merged = mergeRectAreaSide(roomA, 1, [roomA, roomB]);
+    expect(merged).toHaveLength(1);
+    expect(merged![0]!.sideWalls).toEqual({
+      top: [{ start: 0, end: 0.5, state: "wall" }],
+      right: "wall",
+      bottom: [{ start: 0.5, end: 1, state: "divider" }],
+    });
+    expect(merged![0]!.points).toEqual([
+      { x: 0, y: 0 },
+      { x: 200, y: 0 },
+      { x: 200, y: 100 },
+      { x: 0, y: 100 },
+    ]);
+  });
+
+  it("does not join through a different edge than the one clicked", () => {
+    expect(mergeRectAreaSide(roomA, 2, [roomA, roomB])).toBeUndefined();
+    expect(mergeRectAreaSide(roomA, 3, [roomA, roomB])).toBeUndefined();
+    expect(rectAreaEdgeModifierClass(roomA, 2, [roomA, roomB], "join")).toBe("modifier-invalid");
+    expect(rectAreaEdgeModifierClass(roomA, 3, [roomA, roomB], "join")).toBe("modifier-invalid");
+  });
+
+  it("allows joining adjacent rooms when neither is linked to a Home Assistant area", () => {
+    const unlinkedA = { ...roomA, haArea: undefined, sideWalls: undefined };
+    const unlinkedB = { ...roomB, haArea: undefined, sideWalls: undefined };
+    expect(mergeRectAreaSide(unlinkedA, 1, [unlinkedA, unlinkedB])).toHaveLength(1);
+  });
+
+  it("does not join rooms linked to different Home Assistant areas", () => {
+    const otherArea = { ...roomB, haArea: "kitchen" };
+    expect(mergeRectAreaSide(roomA, 1, [roomA, otherArea])).toBeUndefined();
+  });
+
+  it("keeps exterior segments on partial-overlap L-shaped merges by side orientation", () => {
+    const a: Area = {
+      id: "a",
+      points: [{ x: 0, y: 0 }, { x: 100, y: 0 }, { x: 100, y: 100 }, { x: 0, y: 100 }],
+      sideWalls: { right: "divider", bottom: "wall" },
+    } as Area;
+    const b: Area = {
+      id: "b",
+      points: [{ x: 100, y: 50 }, { x: 200, y: 50 }, { x: 200, y: 150 }, { x: 100, y: 150 }],
+      sideWalls: { left: "wall", top: "wall", right: "wall", bottom: "divider" },
+    } as Area;
+
+    const merged = mergeRectAreaSide(a, 1, [a, b]);
+    expect(merged).toHaveLength(1);
+    expect(merged![0]!.sideWalls).toEqual({
+      top: [{ start: 0.5, end: 1, state: "wall" }],
+      right: [{ start: 1 / 3, end: 1, state: "wall" }],
+      bottom: [
+        { start: 0, end: 0.5, state: "wall" },
+        { start: 0.5, end: 1, state: "divider" },
+      ],
+    });
+  });
+
+  it("does not advertise polygon joins that mergeRectAreaSide cannot perform", () => {
+    const polygon: Area = {
+      id: "polygon",
+      haArea: "living-room",
+      points: [
+        { x: 100, y: 0 }, { x: 200, y: 0 }, { x: 200, y: 100 },
+        { x: 150, y: 100 }, { x: 150, y: 50 }, { x: 100, y: 50 },
+      ],
+    } as Area;
+    const areas = [roomA, polygon];
+    expect(rectAreaEdgeModifierClass(roomA, 1, areas, "join")).toBe("modifier-invalid");
+    expect(mergeRectAreaSide(roomA, 1, areas)).toBeUndefined();
   });
 });

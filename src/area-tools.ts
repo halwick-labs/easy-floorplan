@@ -9,14 +9,15 @@ import type {
 import { RECT_AREA_SIDES } from "./types";
 import {
   RECT_AREA_EPSILON,
+  isRectArea,
   polygonEdgeSide,
   rectAreaClamp,
   rectAreaPoints,
   rectAreaSharedSides,
+  rectAreaSideBoundarySegments,
   rectAreaSideWallNext,
   rectAreaSideWallSegments,
 } from "./editor-geometry";
-import { coupleSharedBoundarySegment } from "./area-push-tools";
 import { signedArea, traceFaces } from "./dead-space";
 import { pointInPolygon } from "./render";
 import { createDebugLogger } from "./debug";
@@ -329,8 +330,15 @@ export function splitRectAreaSide(
   const segmentWindow = segmentWindowAt(clickT);
 
   if (typeof prev === "string" && prev !== "none") {
-    sideWalls[side] = [{ start: segmentWindow.start, end: segmentWindow.end, state: prev }];
-    return { ...a, sideWalls };
+    const segments: RectAreaSideWallSegment[] = [];
+    if (segmentWindow.start > RECT_AREA_EPSILON) {
+      segments.push({ start: 0, end: segmentWindow.start, state: prev });
+    }
+    segments.push({ start: segmentWindow.start, end: segmentWindow.end, state: prev });
+    if (segmentWindow.end < 1 - RECT_AREA_EPSILON) {
+      segments.push({ start: segmentWindow.end, end: 1, state: prev });
+    }
+    return applySideWallSegments(a, side, segments).updated;
   }
 
   const segments = rectAreaSideWallSegments(prev).map((segment) => ({ ...segment }));
@@ -443,23 +451,13 @@ export function mergeRectAreaSide(
   const candidates = areas.filter(
     (candidate) =>
       candidate.id !== a.id &&
-      !!a.haArea &&
-      a.haArea === candidate.haArea &&
-      rectAreaSharedSides(a.points, candidate.points).length > 0
+      isRectArea(a.points) &&
+      isRectArea(candidate.points) &&
+      (a.haArea === candidate.haArea || (!a.haArea && !candidate.haArea)) &&
+      rectAreaSharedSides(a.points, candidate.points).includes(clickedSide)
   );
-  const other = candidates.find((candidate) => {
-    const sharedSides = rectAreaSharedSides(a.points, candidate.points);
-    return sharedSides.includes(clickedSide) || sharedSides.includes(rectAreaOppositeSide(clickedSide));
-  }) ?? candidates[0];
+  const other = candidates[0];
   if (!other) return undefined;
-
-  const sharedSides = rectAreaSharedSides(a.points, other.points);
-  const side = sharedSides.includes(clickedSide)
-    ? clickedSide
-    : sharedSides.includes(rectAreaOppositeSide(clickedSide))
-      ? rectAreaOppositeSide(clickedSide)
-      : sharedSides[0];
-  if (!side) return undefined;
 
   const merged = rectAreaUnionPoints(a.points, other.points);
   if (!merged) return undefined;
@@ -470,10 +468,117 @@ export function mergeRectAreaSide(
 
   if (!valid) return undefined;
 
+  const mergedSideWalls = mergeOuterSideWalls(a, other, merged, clickedSide);
+
   return [
     ...areas.filter((candidate) => candidate.id !== a.id && candidate.id !== other.id),
-    { ...a, points: merged, sideWalls: a.sideWalls ?? {} },
+    { ...a, points: merged, sideWalls: mergedSideWalls },
   ];
+}
+
+function mergeOuterSideWalls(
+  a: Area,
+  b: Area,
+  mergedPoints: AreaPoint[],
+  sharedSide: RectAreaSide
+): Area["sideWalls"] {
+  const projected = new Map<RectAreaSide, RectAreaSideWallSegment[]>();
+  const sources = [
+    { area: a, omittedSide: sharedSide },
+    { area: b, omittedSide: rectAreaOppositeSide(sharedSide) },
+  ];
+
+  for (const { area, omittedSide } of sources) {
+    for (const side of RECT_AREA_SIDES) {
+      if (side === omittedSide) continue;
+      const bounds = rectAreaSideBoundarySegments(side, area.points);
+      const sourceLength = bounds.reduce((sum, piece) =>
+        sum + (side === "top" || side === "bottom"
+          ? Math.abs(piece.x2 - piece.x1)
+          : Math.abs(piece.y2 - piece.y1)), 0);
+      if (sourceLength <= RECT_AREA_EPSILON) continue;
+
+      const rawSegments = rectAreaSideWallSegments(area.sideWalls?.[side]);
+      if (!rawSegments.length) continue;
+      const mergedSide = side;
+      const targetBounds = rectAreaSideBoundarySegments(mergedSide, mergedPoints);
+      const targetLength = targetBounds.reduce((sum, piece) =>
+        sum + (mergedSide === "top" || mergedSide === "bottom"
+          ? Math.abs(piece.x2 - piece.x1)
+          : Math.abs(piece.y2 - piece.y1)), 0);
+      if (targetLength <= RECT_AREA_EPSILON) continue;
+
+      for (const segment of rawSegments) {
+        const sourceStart = segment.start * sourceLength;
+        const sourceEnd = segment.end * sourceLength;
+        let sourceCursor = 0;
+        for (const sourceBound of bounds) {
+          const horizontal = side === "top" || side === "bottom";
+          const length = horizontal
+            ? Math.abs(sourceBound.x2 - sourceBound.x1)
+            : Math.abs(sourceBound.y2 - sourceBound.y1);
+          const overlapStart = Math.max(sourceStart, sourceCursor);
+          const overlapEnd = Math.min(sourceEnd, sourceCursor + length);
+          if (overlapEnd > overlapStart + RECT_AREA_EPSILON) {
+            const sourceT0 = (overlapStart - sourceCursor) / length;
+            const sourceT1 = (overlapEnd - sourceCursor) / length;
+            const coord0 = horizontal
+              ? sourceBound.x1 + (sourceBound.x2 - sourceBound.x1) * sourceT0
+              : sourceBound.y1 + (sourceBound.y2 - sourceBound.y1) * sourceT0;
+            const coord1 = horizontal
+              ? sourceBound.x1 + (sourceBound.x2 - sourceBound.x1) * sourceT1
+              : sourceBound.y1 + (sourceBound.y2 - sourceBound.y1) * sourceT1;
+            let targetCursor = 0;
+            for (const targetBound of targetBounds) {
+              const targetBoundLength = horizontal
+                ? Math.abs(targetBound.x2 - targetBound.x1)
+                : Math.abs(targetBound.y2 - targetBound.y1);
+              const targetBoundStart = horizontal
+                ? Math.min(targetBound.x1, targetBound.x2)
+                : Math.min(targetBound.y1, targetBound.y2);
+              const targetBoundEnd = targetBoundStart + targetBoundLength;
+              const worldStart = Math.min(coord0, coord1);
+              const worldEnd = Math.max(coord0, coord1);
+              const projectedStart = Math.max(worldStart, targetBoundStart);
+              const projectedEnd = Math.min(worldEnd, targetBoundEnd);
+              if (projectedEnd > projectedStart + RECT_AREA_EPSILON) {
+                const start = (targetCursor + projectedStart - targetBoundStart) / targetLength;
+                const end = (targetCursor + projectedEnd - targetBoundStart) / targetLength;
+                const segments = projected.get(mergedSide) ?? [];
+                segments.push({ start, end, state: segment.state });
+                projected.set(mergedSide, segments);
+              }
+              targetCursor += targetBoundLength;
+            }
+          }
+          sourceCursor += length;
+        }
+      }
+    }
+  }
+
+  const result: NonNullable<Area["sideWalls"]> = {};
+  for (const [side, segments] of projected) {
+    if (!segments.length) continue;
+    const normalized = normalizeRectAreaSideSegments(segments);
+    result[side] = normalized.length === 1 &&
+      normalized[0]!.start <= RECT_AREA_EPSILON &&
+      normalized[0]!.end >= 1 - RECT_AREA_EPSILON
+      ? normalized[0]!.state
+      : normalized;
+  }
+  return Object.keys(result).length ? result : undefined;
+}
+
+function canMergeRectAreaSide(a: Area, edgeIndex: number, areas: readonly Area[]): boolean {
+  const clickedSide = rectAreaEdgeSide(a, edgeIndex);
+  return areas.some((candidate) =>
+    candidate.id !== a.id &&
+    isRectArea(a.points) &&
+    isRectArea(candidate.points) &&
+    (a.haArea === candidate.haArea || (!a.haArea && !candidate.haArea)) &&
+    rectAreaSharedSides(a.points, candidate.points).includes(clickedSide)
+  );
 }
 
 export function rectAreaEdgeModifierClass(
@@ -483,24 +588,7 @@ export function rectAreaEdgeModifierClass(
   areaEdgeModifier: string
 ): string {
   if (areaEdgeModifier === "join") {
-    const side = rectAreaEdgeSide(area, edgeIndex);
-    const delta = side === "left" || side === "right" ? { dx: 1, dy: 0 } : { dx: 0, dy: 1 };
-    const shared = areas.map((candidate) => {
-      if (candidate.id === area.id || !area.haArea || area.haArea !== candidate.haArea) return false;
-      const rectShared = rectAreaSharedSides(area.points, candidate.points);
-      if (rectShared.includes(side) || rectShared.includes(rectAreaOppositeSide(side))) return {
-        id: candidate.id,
-        rectShared,
-        polygonShared: true,
-      };
-      return {
-        id: candidate.id,
-        rectShared,
-        polygonShared: coupleSharedBoundarySegment(area.points, candidate.points, delta, side) !== undefined,
-      };
-    });
-    const hasMatch = shared.some((candidate) => !!candidate && candidate.polygonShared);
-    return hasMatch ? "modifier-ready" : "modifier-invalid";
+    return canMergeRectAreaSide(area, edgeIndex, areas) ? "modifier-ready" : "modifier-invalid";
   }
   if (areaEdgeModifier === "split") return "modifier-split";
   return "";
