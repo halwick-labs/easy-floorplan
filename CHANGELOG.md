@@ -8,6 +8,10 @@
 - Floor selection buttons can use a dashboard theme preset and an explicit horizontal
   or vertical layout (#353). The editor previews both; CSS variables, parts and floor
   id selectors support custom appearances. Existing plans keep the classic style.
+- LED strips (#298): a cast-light device with a `stripLength` casts its light along a
+  run instead of from a point, with a `stripSide` for a strip mounted on a wall. Walls
+  stop it, the night clears along it, and its ends drag and snap like a wall's in the
+  editor — laid onto a wall, it lights the room it came from. See [LED strips](docs/configuration.md#led-strips).
 - Add a live Line art appearance and optional controls for 2D/3D, appearance,
   quarter-turn rotation and reset. Device states, opening actions and room zoom
   stay interactive. Configure them under Project → Display; new plans include
@@ -25,3 +29,7 @@
   See the [ambient daylight guide](docs/ambient-daylight.md) for the geometry limits.
 - Ambient daylight remains off by default. The direct sunlight and device-light
   layers keep their existing behaviour.
+- Sunlight now lights the floor behind a railing along its whole length. Before,
+  the sun reached a glazed balcony door over the railing, but the balcony floor in
+  front of it stayed dark, so the light seemed to start at the door. The door now
+  carries the railing's light on into the room instead of adding a second patch.

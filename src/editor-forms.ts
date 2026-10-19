@@ -15,6 +15,7 @@ import type {
   FloorplanCardConfig,
   Furniture,
   Opening,
+  Roof,
   SliderStyle,
   Tracker,
   Wall,
@@ -36,6 +37,8 @@ import {
   DEFAULT_ITEM_SIZE,
   DEFAULT_RIPPLE_SIZE,
   DEFAULT_GLOW_RADIUS,
+  DEFAULT_STRIP_LENGTH,
+  MIN_STRIP_LENGTH,
   DEFAULT_TEXT_SIZE,
   DEFAULT_TRACKER_DOT_SIZE,
   DEFAULT_SUN_MIN,
@@ -51,6 +54,7 @@ import {
   badgeContentOf,
   domainIconAnimation,
   entitySupportsGlow,
+  stripRun,
   isRippleEntity,
   normalizeOverlayScale,
   normalizeOverlayMinWidth,
@@ -78,7 +82,13 @@ import {
   openingIsGlazed,
   openingIsPassage,
 } from "./render";
-import { normalizeProjection, normalizeWallHeight, normalizeWallOpacity, MAX_WALL_HEIGHT } from "./projection";
+import {
+  normalizeProjection,
+  normalizeWallHeight,
+  normalizeWallOpacity,
+  MAX_WALL_HEIGHT,
+  defaultRoofHeight,
+} from "./projection";
 import { defaultItemAction } from "./actions";
 import { DEFAULT_SKIN, SKINS, findSkin, MAX_SKIN_WALL_WIDTH } from "./skins";
 
@@ -1341,6 +1351,7 @@ export function itemEffectsForm(
   // of hass, so the control that turns it off does not vanish with it.
   const casts = entitySupportsGlow(entity) || !!it.glow;
   if (!canRipple && !casts) return undefined;
+  const strip = stripRun(it) !== undefined;
   const fields: FormField[] = [];
   if (canRipple) {
     fields.push({
@@ -1396,8 +1407,53 @@ export function itemEffectsForm(
           label: "Light color",
           helper: "Only for bulbs that can't report a color; others use their own",
           selector: { text: {} },
+        },
+        {
+          name: "strip",
+          label: "LED strip",
+          helper: "Casts along a run centred on the device; drag its ends on the plan",
+          selector: { boolean: {} },
         }
       );
+      if (strip) {
+        fields.push(
+          {
+            name: "stripLength",
+            label: "Strip length",
+            selector: { number: { min: MIN_STRIP_LENGTH, max: 2000, step: 1, mode: "box" } },
+          },
+          {
+            name: "stripAngle",
+            label: "Strip direction",
+            selector: {
+              number: { min: 0, max: 360, step: 1, mode: "slider", unit_of_measurement: "°" },
+            },
+          },
+          {
+            name: "stripSide",
+            label: "Lit side",
+            // The review on #372: the editor is where strips get laid out, so
+            // the warning belongs here and not only in the docs.
+            helper:
+              "On a wall, Left or Right, or it lights the room behind it too. Auto picks one when both ends are dragged onto a wall. Seen from its first end",
+            selector: {
+              select: {
+                mode: "dropdown",
+                // "Auto" is the unset side, which lights both until a drag lays
+                // the strip onto a wall. It is spelled out rather than shown
+                // as "Both sides", which would read as a choice the editor then
+                // overrides (second review on #372).
+                options: [
+                  { value: "auto", label: "Auto (both until laid on a wall)" },
+                  { value: "both", label: "Both sides" },
+                  { value: "left", label: "Left" },
+                  { value: "right", label: "Right" },
+                ],
+              },
+            },
+          }
+        );
+      }
     }
   }
   return {
@@ -1410,12 +1466,28 @@ export function itemEffectsForm(
       glow: it.glow ?? false,
       glowRadius: it.glowRadius ?? DEFAULT_GLOW_RADIUS,
       glowColor: it.glowColor ?? "",
+      strip,
+      stripLength: it.stripLength ?? DEFAULT_STRIP_LENGTH,
+      stripAngle: it.stripAngle ?? 0,
+      stripSide: it.stripSide ?? "auto",
     },
-    // "Ripple" is the other half of #127's three-key spelling — same expansion
-    // as the badge group's, with the badge mode read off the item.
     toPatch: (p) => {
-      if (!("ripple" in p)) return p;
-      const { ripple: ring, ...rest } = p;
+      let out = p;
+      // "LED strip" is a length, not a key of its own (issue #298): turning it
+      // on starts the run at a default length along the plan's x axis, and
+      // turning it off clears the run so the device is a point lamp again.
+      if ("strip" in out) {
+        const { strip: on, ...rest } = out;
+        out = on
+          ? { ...rest, stripLength: strip ? it.stripLength : DEFAULT_STRIP_LENGTH }
+          : { ...rest, stripLength: undefined, stripAngle: undefined, stripSide: undefined };
+      }
+      // "Auto" is no key at all: the side a drag may still choose.
+      if (out.stripSide === "auto") out = { ...out, stripSide: undefined };
+      // "Ripple" is the other half of #127's three-key spelling — same
+      // expansion as the badge group's, with the badge mode read off the item.
+      if (!("ripple" in out)) return out;
+      const { ripple: ring, ...rest } = out;
       return { ...rest, ...badgeModePatch(badgeModeOf(it), !!ring) };
     },
   };
@@ -2000,6 +2072,21 @@ export function areaNameForm(a: Area, haAreaNames: readonly string[] = []): Form
 export function areaForm(a: Area): FormSpec {
   return {
     fields: [
+      {
+        name: "zoneKind",
+        label: "Zone type",
+        helper: "Categorizes room vs outdoor zones (lawn, patio, pool, driveway, terrace)",
+        selector: dropdown(
+          opt("indoor", "Indoor / Room"),
+          opt("lawn", "Lawn"),
+          opt("patio", "Patio"),
+          opt("pool", "Pool"),
+          opt("terrace", "Terrace"),
+          opt("driveway", "Driveway"),
+          opt("garden", "Garden"),
+          opt("courtyard", "Courtyard")
+        ),
+      },
       { name: "showName", label: "Show name", selector: { boolean: {} } },
       // Only while the name renders — same rule the item form uses for its
       // label size.
@@ -2107,6 +2194,7 @@ export function areaForm(a: Area): FormSpec {
     ],
     data: {
       showName: a.showName ?? true,
+      zoneKind: a.zoneKind ?? "indoor",
       labelSize: a.labelSize ?? DEFAULT_AREA_LABEL_SIZE,
       opacity: a.opacity ?? DEFAULT_AREA_OPACITY,
       entity: a.entity ?? "",
@@ -2123,6 +2211,7 @@ export function areaForm(a: Area): FormSpec {
     },
     toPatch: (p) => {
       let out = p;
+      if ("zoneKind" in out && (out.zoneKind === "indoor" || !out.zoneKind)) out = { ...out, zoneKind: undefined };
       // "fill" is the default, so keep it out of the YAML.
       if ("highlight" in out && out.highlight === "fill") out = { ...out, highlight: undefined };
       // The toggle is a form-only control: it says whether `zoom` is written
@@ -2133,6 +2222,103 @@ export function areaForm(a: Area): FormSpec {
         // is about to appear — the fit's own ceiling is the natural opening
         // bid, and unlike before it is now a real, re-selectable value.
         out = { ...rest, zoom: fitZoom ? undefined : MAX_AREA_ZOOM_FIT };
+      }
+      return out;
+    },
+  };
+}
+
+export { defaultRoofHeight };
+
+export function roofForm(r: Roof, defaultWallHeight = 60): FormSpec {
+  const isShed = r.type === "shed";
+  const isHipOrGable = r.type === "gable" || r.type === "hip";
+  const isFlat = r.type === "flat";
+  const defaultHeight = defaultRoofHeight(r.type ?? "gable", defaultWallHeight);
+
+  return {
+    fields: [
+      {
+        name: "type",
+        label: "Roof style",
+        helper:
+          r.points && r.points.length > 4 && r.type !== "flat"
+            ? "Pitched roofs span their rectangular bounding box; combine intersecting rectangular roofs for complex footprints"
+            : "Roof geometry (rendered in 3D on outdoor floors)",
+        selector: dropdown(
+          opt("flat", "Flat slab"),
+          opt("gable", "Gable pitch"),
+          opt("hip", "Hip roof"),
+          opt("shed", "Shed (mono-pitch)")
+        ),
+      },
+      ...(isShed
+        ? [
+            {
+              name: "highSide",
+              label: "High side",
+              helper: "Which side slopes up to the ridge height",
+              selector: dropdown(
+                opt("top", "Top / North"),
+                opt("bottom", "Bottom / South"),
+                opt("right", "Right / East"),
+                opt("left", "Left / West")
+              ),
+            },
+          ]
+        : []),
+      ...(isHipOrGable
+        ? [
+            {
+              name: "ridge",
+              label: "Ridge orientation",
+              helper: "Ridge line direction across the roof",
+              selector: dropdown(
+                opt("auto", "Auto (longer side)"),
+                opt("horizontal", "Horizontal (X-axis)"),
+                opt("vertical", "Vertical (Y-axis)")
+              ),
+            },
+          ]
+        : []),
+      ...(!isFlat
+        ? [
+            {
+              name: "height",
+              label: "Ridge height",
+              helper: "Ridge height above eaves across footprint bounding box (canvas units)",
+              selector: { number: { min: 0, max: 200, step: 5, mode: "slider" as const } },
+            },
+          ]
+        : []),
+      {
+        name: "overhang",
+        label: "Overhang / Eaves",
+        helper: "Horizontal eaves projection beyond the footprint",
+        selector: { number: { min: 0, max: 50, step: 1, mode: "slider" as const } },
+      },
+    ],
+    data: {
+      type: r.type ?? "gable",
+      highSide: r.highSide ?? "top",
+      ridge: r.ridge ?? "auto",
+      height: r.height ?? defaultHeight,
+      overhang: r.overhang ?? 0,
+    },
+    toPatch: (p) => {
+      let out = p;
+      if ("type" in out) {
+        if (out.type === "flat") {
+          out = { ...out, highSide: undefined, ridge: undefined };
+        } else if (out.type !== "shed") {
+          out = { ...out, highSide: undefined };
+        }
+      }
+      if ("ridge" in out && (out.ridge === "auto" || !out.ridge)) {
+        out = { ...out, ridge: undefined };
+      }
+      if ("overhang" in out && (out.overhang === 0 || out.overhang === undefined)) {
+        out = { ...out, overhang: undefined };
       }
       return out;
     },
@@ -2163,6 +2349,14 @@ export function wallForm(w: Wall): FormSpec {
           number: { min: 2, max: MAX_SKIN_WALL_WIDTH, step: 1, mode: "slider", unit_of_measurement: "px" },
         },
       },
+      {
+        name: "height",
+        label: "Height",
+        helper: "Override height for 3D view (leave empty to use default card wall height)",
+        selector: {
+          number: { min: 0, max: MAX_WALL_HEIGHT, step: 1, mode: "slider", unit_of_measurement: "px" },
+        },
+      },
       // Issue #182. A dropdown rather than a switch: a railing is one kind of
       // line that is not a wall, and open-plan dividers are the next one asked
       // about (#288).
@@ -2182,12 +2376,14 @@ export function wallForm(w: Wall): FormSpec {
       x2: Math.round(w.x2),
       y2: Math.round(w.y2),
       thickness: w.thickness ?? WALL_THICKNESS,
+      height: w.height,
       kind: w.kind ?? "wall",
     },
     // Keep the defaults out of the YAML so untouched walls stay terse.
     toPatch: (p) => {
       const out = { ...p };
       if ("thickness" in p && p.thickness === WALL_THICKNESS) out.thickness = undefined;
+      if ("height" in p && (p.height === undefined || p.height === null || typeof p.height !== "number")) out.height = undefined;
       if ("kind" in p) out.kind = p.kind === "railing" ? "railing" : undefined;
       return out;
     },
@@ -2774,6 +2970,18 @@ export function projectReliefForm(c: FloorplanCardConfig): FormSpec {
 
 export function floorImageForm(f: Floor): FormSpec {
   const fields: FormField[] = [
+    {
+      name: "isOutdoor",
+      label: "Outdoor courtyard floor",
+      helper: "Flags this floor level as an outdoor courtyard area",
+      selector: { boolean: {} },
+    },
+    {
+      name: "level",
+      label: "Storey level",
+      helper: "Vertical level index for 3D stacking (0 for ground floor, 1 for 1st floor, -1 for basement)",
+      selector: { number: { step: 1, mode: "box" } },
+    },
     { name: "image", label: "Bg image", helper: "/local/floorplan.png or URL", selector: { text: {} } },
   ];
   if (f.image) {
@@ -2796,11 +3004,24 @@ export function floorImageForm(f: Floor): FormSpec {
   return {
     fields,
     data: {
+      isOutdoor: f.isOutdoor ?? false,
+      level: f.level !== undefined ? f.level : "",
       image: f.image ?? "",
       imageFit: f.imageFit ?? "stretch",
       imageOpacity: f.imageOpacity ?? 1,
     },
-    // "stretch" is the default, so keep it out of the YAML.
-    toPatch: (p) => ("imageFit" in p && p.imageFit === "stretch" ? { ...p, imageFit: undefined } : p),
+    toPatch: (p) => {
+      const out = { ...p };
+      if ("imageFit" in out && out.imageFit === "stretch") out.imageFit = undefined;
+      if ("isOutdoor" in out && !out.isOutdoor) out.isOutdoor = undefined;
+      if ("level" in out) {
+        if (out.level === "" || out.level === null || isNaN(Number(out.level))) {
+          out.level = undefined;
+        } else {
+          out.level = Number(out.level);
+        }
+      }
+      return out;
+    },
   };
 }

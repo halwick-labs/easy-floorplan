@@ -20,8 +20,10 @@ import {
   uid,
   configsEqual,
   moveFloor,
+  getFloorRoofs,
+  resolveFloorLevel,
 } from "./types";
-import type { FloorplanCardConfig, TrackerSensor } from "./types";
+import type { FloorplanCardConfig, TrackerSensor, Roof } from "./types";
 
 describe("resolveSnap", () => {
   it("falls back to the grid when snap is unset (the new default)", () => {
@@ -567,5 +569,62 @@ describe("moveFloor (issue #66)", () => {
     expect(moveFloor(floors, "f2", 1)).toBeNull();
     expect(moveFloor(floors, "missing", 1)).toBeNull();
     expect(moveFloor([], "f0", 1)).toBeNull();
+  });
+});
+
+describe("getFloorRoofs", () => {
+  it("returns dedicated floor.roofs when present", () => {
+    const r: Roof = {
+      id: "r1",
+      type: "gable",
+      points: [{ x: 0, y: 0 }, { x: 10, y: 0 }, { x: 10, y: 10 }, { x: 0, y: 10 }],
+      height: 40,
+    };
+    const f = { ...makeFloor("Main"), roofs: [r] };
+    expect(getFloorRoofs(f)).toEqual([r]);
+  });
+
+  it("returns an empty array when floor.roofs is empty or unset", () => {
+    const f = makeFloor("Main");
+    expect(getFloorRoofs(f)).toEqual([]);
+    expect(getFloorRoofs({ ...f, roofs: undefined })).toEqual([]);
+  });
+});
+
+describe("resolveFloorLevel", () => {
+  it("prioritizes explicit level on the floor", () => {
+    const f = { ...makeFloor("Basement"), level: -1 };
+    expect(resolveFloorLevel(f, [f])).toBe(-1);
+    const g = { ...makeFloor("Ground"), level: 0 };
+    expect(resolveFloorLevel(g, [g])).toBe(0);
+    const u = { ...makeFloor("Upper"), level: 2 };
+    expect(resolveFloorLevel(u, [u])).toBe(2);
+  });
+
+  it("falls back to Home Assistant registry floor level", () => {
+    const f = { ...makeFloor("First"), haFloor: "floor_1" };
+    const hass = {
+      floors: {
+        floor_1: { floor_id: "floor_1", name: "First Floor", level: 1 },
+      },
+    };
+    expect(resolveFloorLevel(f, [f], hass)).toBe(1);
+  });
+
+  it("falls back to index among indoor floors when haFloor has no registry match", () => {
+    const f0 = { ...makeFloor("First"), haFloor: "custom_floor" };
+    const f1 = { ...makeFloor("Second"), haFloor: "2" };
+    expect(resolveFloorLevel(f0, [f0, f1])).toBe(0);
+    expect(resolveFloorLevel(f1, [f0, f1])).toBe(1);
+  });
+
+  it("falls back to index among indoor floors", () => {
+    const f0 = { ...makeFloor("Ground") };
+    const outdoor = { ...makeFloor("Garden"), isOutdoor: true };
+    const f1 = { ...makeFloor("Upper") };
+    const all = [f0, outdoor, f1];
+
+    expect(resolveFloorLevel(f0, all)).toBe(0);
+    expect(resolveFloorLevel(f1, all)).toBe(1);
   });
 });

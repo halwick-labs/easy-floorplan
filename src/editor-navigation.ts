@@ -37,6 +37,7 @@ export const SELECTION_PAGES: Record<SelKind, readonly InspectorPage[]> = {
     { id: "visibility", label: "Visibility", groups: ["Visibility"] },
   ],
   area: [properties, { id: "sensor", label: "Sensors", hint: "Sensors and room devices", groups: ["What it reads", "Color", "Home Assistant area"] }, actions],
+  roof: [properties],
   tracker: [
     properties,
     { id: "sensors", label: "Sensors", groups: ["Sensors"] },

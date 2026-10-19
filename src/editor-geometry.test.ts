@@ -27,6 +27,9 @@ import {
   rectAreaClamp,
   rectAreaSharedEdgeCouple,
   rectAreaSharedSides,
+  isSameWallSegment,
+  isAreaCoveredByUpper,
+  stripSideOnWall,
 } from "./editor-geometry";
 import type { OrigPos } from "./editor-geometry";
 import type { Area, Floor, RenderHass, Wall } from "./types";
@@ -254,6 +257,19 @@ describe("elementsAtPoint / cyclePick (issue #52)", () => {
     ]);
   });
 
+  it("picks rooms before roofs on first click and cycles to roof", () => {
+    const withRoof = {
+      ...floor,
+      items: [], walls: [], openings: [], furniture: [], trackers: [], texts: [],
+      areas: [{ id: "a", points: [{ x: 0, y: 0 }, { x: 400, y: 0 }, { x: 400, y: 400 }, { x: 0, y: 400 }] }],
+      roofs: [{ id: "r", points: [{ x: 0, y: 0 }, { x: 400, y: 0 }, { x: 400, y: 400 }, { x: 0, y: 400 }] }],
+    } as unknown as Floor;
+    const candidates = elementsAtPoint(withRoof, 200, 200, opts);
+    expect(candidates.map((s) => s.kind)).toEqual(["area", "roof"]);
+    expect(cyclePick(candidates, [], false)).toEqual({ kind: "area", id: "a" });
+    expect(cyclePick(candidates, [{ kind: "area", id: "a" }], true)).toEqual({ kind: "roof", id: "r" });
+  });
+
   it("cyclePick steps down the stack on repeat clicks and wraps", () => {
     const c = elementsAtPoint(floor, 100, 200, opts);
     // First click at a fresh spot: most specific.
@@ -450,6 +466,9 @@ describe("isValidRectilinearAreaResize", () => {
     ];
     const after = before.map((point, index) =>
       index === 2 || index === 3 ? { ...point, y: 250 } : { ...point }
+    );
+    expect(isValidRectilinearAreaResize(before, after)).toBe(false);
+  });
 
   it("rejects a resize that collapses a previously nonzero arm edge", () => {
     const before = [
@@ -468,9 +487,6 @@ describe("isValidRectilinearAreaResize", () => {
       { x: 10, y: 20 },
       { x: 0, y: 20 },
     ];
-    expect(isValidRectilinearAreaResize(before, after)).toBe(false);
-  });
-    );
     expect(isValidRectilinearAreaResize(before, after)).toBe(false);
   });
 });
@@ -1305,5 +1321,83 @@ describe("picking a skylight (issue #285)", () => {
     expect(elementsAtPoint(withDoor, 200, 200, opts)[0]).toEqual({ kind: "opening", id: "d" });
     expect(elementsAtPoint(withDoor, 200, 206, opts)[0]).toEqual({ kind: "opening", id: "d" });
     expect(elementsAtPoint(withDoor, 200, 220, opts).map((s) => s.kind)).not.toContain("opening");
+  });
+});
+
+describe("multi-floor stacking geometry helpers", () => {
+  it("determines whether an area is covered by upper polygons", () => {
+    const areaA: Area = {
+      id: "a1",
+      points: [
+        { x: 100, y: 100 },
+        { x: 400, y: 100 },
+        { x: 400, y: 400 },
+        { x: 100, y: 400 },
+      ],
+    };
+    const upperCovering = [
+      [
+        { x: 50, y: 50 },
+        { x: 500, y: 50 },
+        { x: 500, y: 500 },
+        { x: 50, y: 500 },
+      ],
+    ];
+    const upperDisjoint = [
+      [
+        { x: 600, y: 600 },
+        { x: 800, y: 600 },
+        { x: 800, y: 800 },
+        { x: 600, y: 800 },
+      ],
+    ];
+
+    expect(isAreaCoveredByUpper(areaA, upperCovering)).toBe(true);
+    expect(isAreaCoveredByUpper(areaA, upperDisjoint)).toBe(false);
+    expect(isAreaCoveredByUpper(areaA, [])).toBe(false);
+    expect(isAreaCoveredByUpper({ id: "empty", points: [] } as any, upperCovering)).toBe(true);
+  });
+
+  it("detects identical wall segments in either direction", () => {
+    const w1 = { x1: 100, y1: 100, x2: 500, y2: 100 } as Wall;
+    const w2 = { x1: 100, y1: 100, x2: 500, y2: 100 } as Wall;
+    const w3 = { x1: 500, y1: 100, x2: 100, y2: 100 } as Wall;
+    const w4 = { x1: 100, y1: 100, x2: 500, y2: 200 } as Wall;
+
+    expect(isSameWallSegment(w1, w2)).toBe(true);
+    expect(isSameWallSegment(w1, w3)).toBe(true);
+    expect(isSameWallSegment(w1, w4)).toBe(false);
+  });
+});
+
+describe("stripSideOnWall (issue #298, review on #372)", () => {
+  const top = [{ x1: 100, y1: 100, x2: 500, y2: 100 }];
+
+  it("lights the side the light came from once both ends are on one wall", () => {
+    // Running east along the top wall: the room below is its right.
+    expect(stripSideOnWall(top, 100, 100, 500, 100, { x: 300, y: 250 })).toBe("right");
+    expect(stripSideOnWall(top, 100, 100, 500, 100, { x: 300, y: -50 })).toBe("left");
+    // Run the other way and the same room is on its left.
+    expect(stripSideOnWall(top, 500, 100, 100, 100, { x: 300, y: 250 })).toBe("left");
+  });
+
+  it("chooses nothing off the wall, or with only one end on it", () => {
+    expect(stripSideOnWall(top, 100, 140, 500, 140, { x: 300, y: 250 })).toBeUndefined();
+    expect(stripSideOnWall(top, 100, 100, 300, 300, { x: 300, y: 250 })).toBeUndefined();
+  });
+
+  it("asks the rooms when the light was already on the wall", () => {
+    const below = (_x: number, y: number) => y > 100;
+    expect(stripSideOnWall(top, 100, 100, 500, 100, { x: 300, y: 100 }, below)).toBe("right");
+    // Rooms on both sides, or none: no way to tell.
+    expect(stripSideOnWall(top, 100, 100, 500, 100, { x: 300, y: 100 }, () => true)).toBeUndefined();
+    expect(stripSideOnWall(top, 100, 100, 500, 100, { x: 300, y: 100 })).toBeUndefined();
+  });
+
+  it("asks past the face of a thick wall, not inside it", () => {
+    // 24 wide: its faces are 12 out, and the rooms start there.
+    const thick = [{ ...top[0]!, thickness: 24 }];
+    const below = (_x: number, y: number) => y > 112;
+    expect(stripSideOnWall(thick, 100, 100, 500, 100, { x: 300, y: 100 }, below)).toBe("right");
   });
 });

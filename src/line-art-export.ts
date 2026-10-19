@@ -8,9 +8,9 @@ import {
   rotatePlanPoint, wallThickness, type OpeningStyle, type PlanRotation,
 } from "./render";
 import {
-  elevationShift, furnitureSolid, FURNITURE_HEIGHT_FRACTION,
+  elevationShift, furnitureSolid, FURNITURE_HEIGHT_FRACTION, OUTDOOR_WALL_HEIGHT_MULTIPLIER,
   normalizeProjection, normalizeWallHeight, planProjectionTransform, projectPlanPoint,
-  projectedCanvasSize, renderIsoSolids, wallSolids, type DisplayFrame, type IsoSolid,
+  projectedCanvasSize, renderIsoSolids, wallSolids, openingWallHeight, wallHeadroom, type DisplayFrame, type IsoSolid,
 } from "./projection";
 import { openingSolids } from "./projection-openings";
 import { LINE_INK, solidEdgeRenderer } from "./line-art";
@@ -30,15 +30,21 @@ export interface LineArtExport {
   filename: string;
 }
 
-/** Uses the card's full canvas and current rotation, never its transient zoom. */
+/**
+ * Uses the card's full canvas and current rotation, never its transient zoom.
+ * Exports a single floor's architectural line art without multi-story stacking
+ * or opaque roof caps, keeping room layouts visible.
+ */
 export function createLineArtSvg(c: FloorplanCardConfig, floor: Floor, rot: PlanRotation): LineArtExport {
   const width = Math.max(1, cssNumber(c.width, DEFAULT_WIDTH));
   const height = Math.max(1, cssNumber(c.height, DEFAULT_HEIGHT));
   const walls = [...floor.walls, ...floor.areas.flatMap((a) => rectAreaSideWalls(a.id, a.points, a.sideWalls ?? {}))];
+  const defaultWallHeight = normalizeWallHeight(c.wallHeight);
+  const effectiveBaseHeight = defaultWallHeight * (floor.isOutdoor ? OUTDOOR_WALL_HEIGHT_MULTIPLIER : 1);
   const frame: DisplayFrame = {
     ...rotatedCanvasSize(width, height, rot),
     projection: normalizeProjection(c.view ?? c.projection),
-    wallHeight: normalizeWallHeight(c.wallHeight),
+    wallHeight: wallHeadroom(effectiveBaseHeight, walls),
     padding: 2 + walls.reduce((max, w) => Math.max(max, wallThickness(w.thickness)), 8),
   };
   const dims = projectedCanvasSize(frame);
@@ -53,9 +59,12 @@ export function createLineArtSvg(c: FloorplanCardConfig, floor: Floor, rot: Plan
       const a = map(w.x1, w.y1), b = map(w.x2, w.y2);
       return { ...w, x1: a.x, y1: a.y, x2: b.x, y2: b.y,
         thickness: wallThickness(w.thickness) * (isRailing(w) ? RAILING_WEIGHT : 1) };
-    }), floor.openings.map((o) => ({ ...o, ...map(o.x, o.y), angle: o.angle + rot })), frame.wallHeight, false));
-    for (const o of floor.openings) solids.push(...openingSolids(o, openingStyle(o), map, frame.wallHeight));
-    const h = frame.wallHeight * FURNITURE_HEIGHT_FRACTION;
+    }), floor.openings.map((o) => ({ ...o, ...map(o.x, o.y), angle: o.angle + rot })), defaultWallHeight, false));
+    for (const o of floor.openings) {
+      const h = openingWallHeight(o, floor.walls, defaultWallHeight);
+      solids.push(...openingSolids(o, openingStyle(o), map, h));
+    }
+    const h = defaultWallHeight * FURNITURE_HEIGHT_FRACTION;
     const lift = elevationShift(h, rot);
     for (const f of floor.furniture) solids.push(furnitureSolid(f, map, h, PAPER,
       svg`<g transform=${rotate || nothing}><g transform="translate(${lift.x} ${lift.y})">${drawFurniture(f)}</g></g>`));

@@ -1,22 +1,31 @@
-import { WALL_THICKNESS, pointInPolygon, polygonCentroid, textLabel, openingHitSize } from "./render";
-import type {
-  AreaPoint,
-  Area,
-  RectAreaSide,
-  RectAreaSideWallState,
-  RectAreaSideWallValue,
+import { 
+  WALL_THICKNESS, 
+  pointInPolygon, 
+  polygonCentroid, 
+  textLabel, 
+  wallThickness,
+  openingHitSize 
+} from "./render";
+
+import { 
+  AreaPoint, 
+  Area, 
+  RectAreaSide, 
+  RectAreaSideWallState, 
+  RectAreaSideWalls, 
+  Wall, 
+  Floor, 
+  RenderHass, 
+  StripSide,
   RectAreaSideWallSegment,
-  RectAreaSideWalls,
-  Wall,
-  Floor,
-  RenderHass,
+  RectAreaSideWallValue,
 } from "./types";
 import { RECT_AREA_SIDES } from "./types";
 
 export const RECT_AREA_EPSILON = 0.001;
 
 /** Element kinds addressable by the editor's selection model. */
-export type SelKind = "wall" | "opening" | "item" | "text" | "furniture" | "tracker" | "area";
+export type SelKind = "wall" | "opening" | "item" | "text" | "furniture" | "tracker" | "area" | "roof";
 
 export interface Sel {
   kind: SelKind;
@@ -682,6 +691,66 @@ function nearestOf(
   return best;
 }
 
+/** Distance from a point to a wall segment. */
+function distToWall(x: number, y: number, w: WallSegment): number {
+  const dx = w.x2 - w.x1;
+  const dy = w.y2 - w.y1;
+  const len2 = dx * dx + dy * dy;
+  const t = len2 === 0 ? 0 : Math.max(0, Math.min(1, ((x - w.x1) * dx + (y - w.y1) * dy) / len2));
+  return Math.hypot(x - (w.x1 + t * dx), y - (w.y1 + t * dy));
+}
+
+/** How close both ends must be to one wall for a strip to count as on it. */
+export const STRIP_ON_WALL_EPS = 0.5;
+
+/**
+ * The side a strip laid onto a wall should light (issue #298, review on
+ * #372), or undefined when it is not on one.
+ *
+ * A strip snapped end to end along a wall sits on its centreline, and lit on
+ * both sides it would light the room behind the wall too — the very thing a
+ * strip on a wall must not do. So once both ends are on the same wall, it
+ * lights the side `from` is on: where the light was before it reached the
+ * wall, which is the room it was being laid out in. A `from` on the wall line
+ * itself — a lamp already placed on the wall — falls back to `inRoom`: the
+ * side that a room is on, when only one of them has one. A strip off every
+ * wall gets no side.
+ *
+ * The rooms are asked just past the wall's face, so the probe reads the
+ * wall's own `thickness` (second review on #372): a fixed distance lands
+ * inside a thick wall, where neither side is a room, and quietly leaves the
+ * strip lit on both.
+ */
+export function stripSideOnWall(
+  walls: readonly (WallSegment & Pick<Wall, "thickness">)[],
+  x1: number,
+  y1: number,
+  x2: number,
+  y2: number,
+  from: { x: number; y: number },
+  inRoom?: (x: number, y: number) => boolean
+): Exclude<StripSide, "both"> | undefined {
+  const on = walls.find(
+    (w) => distToWall(x1, y1, w) <= STRIP_ON_WALL_EPS && distToWall(x2, y2, w) <= STRIP_ON_WALL_EPS
+  );
+  if (!on) return undefined;
+  const len = Math.hypot(x2 - x1, y2 - y1);
+  if (len === 0) return undefined;
+  // Left of the run is (dy, -dx) on a y-down plan, as in stripRun.
+  const side = ((from.x - x1) * (y2 - y1) - (from.y - y1) * (x2 - x1)) / len;
+  if (Math.abs(side) > STRIP_ON_WALL_EPS) return side > 0 ? "left" : "right";
+  if (!inRoom) return undefined;
+  // Probe a wall's width past this wall's face, on each side of the middle.
+  const nx = (y2 - y1) / len;
+  const ny = -(x2 - x1) / len;
+  const mx = (x1 + x2) / 2;
+  const my = (y1 + y2) / 2;
+  const probe = wallThickness(on.thickness) / 2 + WALL_THICKNESS;
+  const left = inRoom(mx + nx * probe, my + ny * probe);
+  const right = inRoom(mx - nx * probe, my - ny * probe);
+  return left === right ? undefined : left ? "left" : "right";
+}
+
 /** Nearest existing wall endpoint within `maxDist`, or null. */
 export function nearestCorner(
   walls: readonly WallSegment[],
@@ -853,6 +922,10 @@ export function elementsInRect(f: Floor, m: Rect): Sel[] {
     const c = polygonCentroid(a.points);
     if (inside(c.x, c.y)) out.push({ kind: "area", id: a.id });
   }
+  for (const r of f.roofs ?? []) {
+    const c = polygonCentroid(r.points);
+    if (inside(c.x, c.y)) out.push({ kind: "roof", id: r.id });
+  }
   return out;
 }
 
@@ -891,6 +964,12 @@ export function applyDelta(f: Floor, dx: number, dy: number, orig: Map<string, O
         ? { ...el, points: o.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) }
         : el;
     }),
+    roofs: (f.roofs ?? []).map((el) => {
+      const o = orig.get(`roof:${el.id}`);
+      return o && o.kind === "polygon"
+        ? { ...el, points: o.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) }
+        : el;
+    }),
   };
 }
 
@@ -909,10 +988,12 @@ const PICK_ORDER: SelKind[] = [
   "furniture",
   "wall",
   "tracker",
-  // Room polygons are the largest thing on the plan and usually cover
-  // everything else in the room, so they pick last — but they *are* in the
-  // list, so cycling can still reach them.
+  // Room polygons cover devices and walls, so they pick after specific elements.
   "area",
+  // Roof polygons are building-level envelopes that cover multiple rooms or the
+  // whole floor, so they pick after areas on first click — but cycling can still
+  // reach them.
+  "roof",
 ];
 
 /** Hit tolerances in virtual units. Wall matches the editor's fat hit stroke. */
@@ -1006,6 +1087,9 @@ export function elementsAtPoint(
     const p = toLocal(x, y, tr.x + tr.w / 2, tr.y + tr.h / 2, tr.angle ?? 0);
     if (Math.abs(p.x) <= tr.w / 2 && Math.abs(p.y) <= tr.h / 2) push("tracker", tr.id, i, tr.locked);
   });
+  (f.roofs ?? []).forEach((r, i) => {
+    if (pointInPolygon(r.points, x, y)) push("roof", r.id, i, r.locked);
+  });
   (f.areas ?? []).forEach((a, i) => {
     if (pointInPolygon(a.points, x, y)) push("area", a.id, i, a.locked);
   });
@@ -1046,6 +1130,8 @@ export function findElement(f: Floor, sel: Sel): { id: string; locked?: boolean 
       return (f.trackers ?? []).find((x) => x.id === sel.id);
     case "area":
       return (f.areas ?? []).find((x) => x.id === sel.id);
+    case "roof":
+      return (f.roofs ?? []).find((x) => x.id === sel.id);
   }
 }
 
@@ -1097,3 +1183,40 @@ export function cyclePick(
   const i = candidates.findIndex((c) => c.kind === current[0]!.kind && c.id === current[0]!.id);
   return i < 0 ? candidates[0]! : candidates[(i + 1) % candidates.length]!;
 }
+
+export function isSameWallSegment(w1: Wall, w2: Wall, eps = 1): boolean {
+  return (
+    (Math.hypot(w1.x1 - w2.x1, w1.y1 - w2.y1) <= eps && Math.hypot(w1.x2 - w2.x2, w1.y2 - w2.y2) <= eps) ||
+    (Math.hypot(w1.x1 - w2.x2, w1.y1 - w2.y2) <= eps && Math.hypot(w1.x2 - w2.x1, w1.y2 - w2.y1) <= eps)
+  );
+}
+
+/**
+ * Test whether a lower-floor area is covered by upper-floor areas/rooms.
+ */
+export function isAreaCoveredByUpper(
+  area: Area,
+  upperPolygons: readonly (readonly AreaPoint[])[]
+): boolean {
+  if (!area.points || area.points.length < 3) return true;
+  if (!upperPolygons.length) return false;
+  const centroid = polygonCentroid(area.points);
+  if (centroid && upperPolygons.some((poly) => pointInPolygon(poly, centroid.x, centroid.y))) {
+    return true;
+  }
+  if (centroid) {
+    const interiorPoints = area.points.map((p) => ({
+      x: (p.x + centroid.x) / 2,
+      y: (p.y + centroid.y) / 2,
+    }));
+    if (
+      interiorPoints.length > 0 &&
+      interiorPoints.every((ip) => upperPolygons.some((poly) => pointInPolygon(poly, ip.x, ip.y)))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+
