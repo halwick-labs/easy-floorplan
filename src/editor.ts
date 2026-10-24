@@ -1,5 +1,5 @@
 import { LitElement, html, css, svg, nothing, type TemplateResult, type PropertyValues } from "lit";
-import { customElement, property, state, query } from "lit/decorators.js";
+import { property, state, query } from "lit/decorators.js";
 import { PROJECT_PAGES, SELECTION_PAGES, type InspectorPage } from "./editor-navigation";
 import { editorWorkspaceStyles } from "./editor-workspace-styles";
 import { repeat } from "lit/directives/repeat.js";
@@ -435,7 +435,6 @@ function isTypingPath(path: EventTarget[]): boolean {
   });
 }
 
-@customElement("easy-floorplan-card-editor")
 export class FloorplanCardEditor extends LitElement {
   private static _nextWallMaskId = 0;
   /** Unique mask id so multiple editor instances don't collide. */
@@ -736,6 +735,13 @@ export class FloorplanCardEditor extends LitElement {
     this._gesturePointer = null;
     this._resetPinch();
     super.disconnectedCallback();
+  }
+
+  /** Host-supplied geometry edits share the normal undo/redo and change event. */
+  public applyConfigEdit(config: FloorplanCardConfig): void {
+    validateYCoordinates(config);
+    this._pushHistory();
+    this._emit(config);
   }
 
   public setConfig(config: FloorplanCardConfig): void {
@@ -9095,4 +9101,9 @@ declare global {
   interface HTMLElementTagNameMap {
     "easy-floorplan-card-editor": FloorplanCardEditor;
   }
+}
+
+// The spatial fork may be loaded alongside the original HACS card.
+if (!customElements.get("easy-floorplan-card-editor")) {
+  customElements.define("easy-floorplan-card-editor", FloorplanCardEditor);
 }

@@ -1,3 +1,5 @@
+> **Spatial Lighting fork:** adds a metric, data-only room editor adapter and flexible corner editing. See [SPATIAL_LIGHTING.md](SPATIAL_LIGHTING.md). Original Easy Floorplan features and MIT attribution are retained.
+
 # Easy Floorplan
 
 [![hacs][hacs-badge]][hacs-url]

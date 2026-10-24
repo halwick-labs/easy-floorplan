@@ -22,3 +22,6 @@ console.info(
   "background:#03a9f4;color:#fff",
   "color:#03a9f4"
 );
+
+// Optional host adapter; the host retains room storage and scene playback.
+export { SpatialFloorplanEditor } from "./spatial-editor";
